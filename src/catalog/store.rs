@@ -46,6 +46,16 @@ pub(crate) const FILE_COLUMNS: &str =
      created_time, modified_time, accessed_time, category, container_chain, \
      status, first_seen_at, last_seen_at, original_path";
 
+/// Where one archived entry row moves to once its archive has been extracted.
+/// `container_chain` is `None` when the entry became a loose file, or the remaining chain when
+/// its first hop was a nested archive that is now a file on disk (the row stays archived, just
+/// re-pointed at the extracted inner archive).
+pub struct EntryMove {
+    pub id: i64,
+    pub relative_path: String,
+    pub container_chain: Option<String>,
+}
+
 impl Catalog {
     pub fn upsert_volume(&self, v: &Volume) -> anyhow::Result<()> {
         self.conn.execute(
@@ -828,6 +838,32 @@ impl Catalog {
         Ok(rows)
     }
 
+    /// Rewrite archived entry rows in place, all or nothing.
+    ///
+    /// In place, rather than delete-and-reinsert, because `id`, `content_hash` and `first_seen_at`
+    /// carry the file's whole history and every other table refers to the id. One transaction,
+    /// because a half-applied conversion would leave the catalogue describing a layout that never
+    /// existed on disk -- some entries pointing at files extraction actually wrote, others still
+    /// claiming to live inside an archive that is about to move into quarantine. The unique index
+    /// `idx_files_loose_identity` on `(volume_id, relative_path)` (`container_chain IS NULL`) is
+    /// what catches a collision -- e.g. two entries extracting to the same loose path -- and the
+    /// rollback on that error is the whole point of doing this as one transaction rather than one
+    /// UPDATE per row.
+    pub fn convert_archive_entries(&self, moves: &[EntryMove], now: i64) -> anyhow::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE files SET relative_path=?2, container_chain=?3, last_seen_at=?4
+                 WHERE id=?1",
+            )?;
+            for m in moves {
+                stmt.execute(params![m.id, m.relative_path, m.container_chain, now])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Update a loose archive row's hash/size after a rebuild (repack).
     pub fn update_archive_hash(
         &self,
@@ -1165,7 +1201,7 @@ impl crate::tree_hash::DirSink for InsertSink<'_> {
 mod tests {
     use crate::archive::ArchiveEntry;
     use crate::catalog::models::*;
-    use crate::catalog::store::SearchFilters;
+    use crate::catalog::store::{EntryMove, SearchFilters};
     use crate::catalog::Catalog;
 
     fn mk_entry(chain: &str, hash: &str) -> ArchiveEntry {
@@ -1577,6 +1613,107 @@ mod tests {
             Some("photos.zip › vacation.jpg")
         );
         assert_eq!(hits[0].relative_path, "backups/old.zip");
+    }
+
+    #[test]
+    fn converting_an_entry_keeps_its_id_hash_and_history() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_archive_entry("vol-1", "bundle.zip", &mk_entry("a.txt", "h1"), None, 200)
+            .unwrap();
+        let before = cat
+            .archive_entries("vol-1", "bundle.zip")
+            .unwrap()
+            .remove(0);
+
+        cat.convert_archive_entries(
+            &[EntryMove {
+                id: before.id,
+                relative_path: "bundle/a.txt".into(),
+                container_chain: None,
+            }],
+            999,
+        )
+        .unwrap();
+
+        let after = cat.get_file(before.id).unwrap().unwrap();
+        assert_eq!(after.id, before.id, "id survives");
+        assert_eq!(after.content_hash, before.content_hash, "hash survives");
+        assert_eq!(
+            after.first_seen_at, before.first_seen_at,
+            "history survives"
+        );
+        assert_eq!(after.relative_path, "bundle/a.txt");
+        assert!(after.container_chain.is_none(), "now a loose file");
+    }
+
+    #[test]
+    fn a_nested_entry_is_repointed_at_the_extracted_inner_archive() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_archive_entry(
+            "vol-1",
+            "bundle.zip",
+            &mk_entry("inner.zip › deep.txt", "h1"),
+            None,
+            200,
+        )
+        .unwrap();
+        let before = cat
+            .archive_entries("vol-1", "bundle.zip")
+            .unwrap()
+            .remove(0);
+
+        cat.convert_archive_entries(
+            &[EntryMove {
+                id: before.id,
+                relative_path: "bundle/inner.zip".into(),
+                container_chain: Some("deep.txt".into()),
+            }],
+            999,
+        )
+        .unwrap();
+
+        let after = cat.get_file(before.id).unwrap().unwrap();
+        assert_eq!(after.relative_path, "bundle/inner.zip");
+        assert_eq!(after.container_chain.as_deref(), Some("deep.txt"));
+    }
+
+    #[test]
+    fn a_failing_move_rolls_back_every_other_move() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_file(&mk_file("vol-1", "bundle/a.txt", "h9"), 200)
+            .unwrap(); // already occupies the loose path
+        cat.upsert_archive_entry("vol-1", "bundle.zip", &mk_entry("a.txt", "h1"), None, 200)
+            .unwrap();
+        cat.upsert_archive_entry("vol-1", "bundle.zip", &mk_entry("b.txt", "h2"), None, 200)
+            .unwrap();
+        let rows = cat.archive_entries("vol-1", "bundle.zip").unwrap();
+
+        let err = cat.convert_archive_entries(
+            &[
+                EntryMove {
+                    id: rows[1].id,
+                    relative_path: "bundle/b.txt".into(),
+                    container_chain: None,
+                },
+                EntryMove {
+                    id: rows[0].id,
+                    relative_path: "bundle/a.txt".into(),
+                    container_chain: None,
+                },
+            ],
+            999,
+        );
+
+        assert!(
+            err.is_err(),
+            "the unique loose index must reject the collision"
+        );
+        let b = cat.get_file(rows[1].id).unwrap().unwrap();
+        assert_eq!(
+            b.container_chain.as_deref(),
+            Some("b.txt"),
+            "the first move must have been rolled back, not left half-applied"
+        );
     }
 
     #[test]
