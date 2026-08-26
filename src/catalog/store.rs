@@ -31,6 +31,16 @@ pub struct FolderChild {
     pub total_bytes: i64,
 }
 
+/// One row per archive that still has active catalogued entries, with what extracting it costs.
+/// This is what the Extract page lists; the per-archive verdict is computed separately, against a
+/// live mount.
+#[derive(Debug, Clone)]
+pub struct ArchiveRoot {
+    pub relative_path: String,
+    pub entries: i64,
+    pub uncompressed_bytes: i64,
+}
+
 pub(crate) const FILE_COLUMNS: &str =
     "id, volume_id, relative_path, filename, extension, size_bytes, content_hash, \
      created_time, modified_time, accessed_time, category, container_chain, \
@@ -794,6 +804,26 @@ impl Catalog {
             ))?;
         let rows = stmt
             .query_map(params![volume_id, archive_rel_path], Self::map_file_record)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Every archive on this volume that still has active catalogued entries, one row per archive
+    /// with the entry count and total uncompressed size extracting it would need.
+    pub fn archive_roots(&self, volume_id: &str) -> anyhow::Result<Vec<ArchiveRoot>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT relative_path, COUNT(*), COALESCE(SUM(size_bytes),0) FROM files
+             WHERE volume_id=?1 AND container_chain IS NOT NULL AND status='active'
+             GROUP BY relative_path ORDER BY SUM(size_bytes) DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![volume_id], |r| {
+                Ok(ArchiveRoot {
+                    relative_path: r.get(0)?,
+                    entries: r.get(1)?,
+                    uncompressed_bytes: r.get(2)?,
+                })
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -2024,6 +2054,33 @@ mod tests {
         assert!(es
             .iter()
             .all(|r| r.relative_path == "a.zip" && r.container_chain.is_some()));
+    }
+
+    #[test]
+    fn archive_roots_lists_each_container_once_with_its_totals() {
+        let (_t, cat) = open_tmp();
+        let e = |chain: &str, size: i64, hash: &str| crate::archive::ArchiveEntry {
+            container_chain: chain.into(),
+            filename: chain.rsplit('/').next().unwrap().into(),
+            extension: "txt".into(),
+            size_bytes: size,
+            content_hash: hash.into(),
+        };
+        cat.upsert_archive_entry("vol-1", "a/bundle.zip", &e("one.txt", 10, "h1"), None, 100)
+            .unwrap();
+        cat.upsert_archive_entry("vol-1", "a/bundle.zip", &e("two.txt", 20, "h2"), None, 100)
+            .unwrap();
+        cat.upsert_archive_entry("vol-1", "b/other.zip", &e("three.txt", 5, "h3"), None, 100)
+            .unwrap();
+
+        let roots = cat.archive_roots("vol-1").unwrap();
+        assert_eq!(roots.len(), 2, "one row per archive, not per entry");
+        let bundle = roots
+            .iter()
+            .find(|r| r.relative_path == "a/bundle.zip")
+            .unwrap();
+        assert_eq!(bundle.entries, 2);
+        assert_eq!(bundle.uncompressed_bytes, 30);
     }
 
     #[test]

@@ -8,6 +8,8 @@
 
 use std::path::Path;
 
+use crate::catalog::Catalog;
+
 /// Windows' classic path limit. Rust can write past it through `\\?\`, but Explorer and most
 /// applications then cannot open the file — useless for data whose whole purpose is being reachable.
 pub const MAX_PATH_CHARS: usize = 260;
@@ -80,6 +82,10 @@ pub fn fits_budget(mount_root: &Path, archive_rel: &str, chain: &str) -> bool {
 }
 
 /// The character count `fits_budget` compares, exposed so refusals can report the real number.
+///
+/// Counted in UTF-16 code units, not `char`s, because that is what Windows' MAX_PATH actually
+/// measures: an astral character (e.g. most emoji) is one `char` but two UTF-16 code units, and
+/// counting chars would under-count exactly the paths this check exists to catch.
 pub fn full_length(mount_root: &Path, archive_rel: &str, chain: &str) -> usize {
     let root = mount_root.to_string_lossy();
     let sep = if root.ends_with('\\') || root.ends_with('/') {
@@ -87,7 +93,86 @@ pub fn full_length(mount_root: &Path, archive_rel: &str, chain: &str) -> usize {
     } else {
         1
     };
-    root.chars().count() + sep + final_relative_path(archive_rel, chain).chars().count()
+    root.encode_utf16().count()
+        + sep
+        + final_relative_path(archive_rel, chain)
+            .encode_utf16()
+            .count()
+}
+
+/// Whether an archive can be extracted, or the single reason it cannot.
+pub enum Scope {
+    InScope {
+        entries: usize,
+        uncompressed_bytes: i64,
+    },
+    Refused(String),
+}
+
+/// Bytes that must remain free after an extraction. Refusing an archive is recoverable; filling a
+/// drive that holds irreplaceable data is not.
+pub const SPACE_HEADROOM_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Every reason an archive can be refused, checked before anything is written. Ordered cheapest
+/// first, and deliberately shared by the Extract page and the worker so the page cannot promise
+/// something the worker will refuse.
+pub fn scope_check(
+    cat: &Catalog,
+    mount_root: &Path,
+    volume_id: &str,
+    archive_rel: &str,
+) -> anyhow::Result<Scope> {
+    let entries = cat.archive_entries(volume_id, archive_rel)?;
+    if entries.is_empty() {
+        return Ok(Scope::Refused(
+            "no catalogued entries: nothing to verify an extraction against".into(),
+        ));
+    }
+
+    for e in &entries {
+        let chain = e.container_chain.as_deref().unwrap_or_default();
+        if !fits_budget(mount_root, archive_rel, chain) {
+            let n = full_length(mount_root, archive_rel, chain);
+            return Ok(Scope::Refused(format!(
+                "entry would need {n} characters, over the {MAX_PATH_CHARS} limit: {chain}"
+            )));
+        }
+        // A purged or quarantined row can still own the loose path this entry would take.
+        let target = final_relative_path(archive_rel, chain);
+        if cat.loose_path_taken(volume_id, &target)? {
+            return Ok(Scope::Refused(format!(
+                "the catalogue already has a loose file at {target}"
+            )));
+        }
+    }
+
+    let dest = destination_dir(archive_rel);
+    if mount_root.join(&dest).exists() {
+        return Ok(Scope::Refused(format!(
+            "destination folder {dest} already exists; refusing to merge into it"
+        )));
+    }
+
+    let uncompressed: i64 = entries.iter().map(|e| e.size_bytes).sum();
+    let required = uncompressed as u64 + SPACE_HEADROOM_BYTES;
+    match crate::repack::available_space(mount_root) {
+        Some(free) if free < required => {
+            return Ok(Scope::Refused(format!(
+                "needs {required} bytes free (content {uncompressed} + 5 GiB headroom), {free} available"
+            )));
+        }
+        Some(_) => {}
+        None => {
+            return Ok(Scope::Refused(
+                "could not determine free space on the drive; refusing rather than guessing".into(),
+            ));
+        }
+    }
+
+    Ok(Scope::InScope {
+        entries: entries.len(),
+        uncompressed_bytes: uncompressed,
+    })
 }
 
 #[cfg(test)]
@@ -155,5 +240,99 @@ mod tests {
             "bundle.zip",
             &format!("{chain}{}", "y".repeat(40))
         ));
+    }
+
+    #[test]
+    fn an_astral_character_counts_as_two_utf16_units_not_one_char() {
+        // U+1F600 GRINNING FACE: one `char`, but a UTF-16 surrogate pair (2 code units) -- and
+        // Windows' MAX_PATH is measured in UTF-16 code units, so undercounting it as 1 is the
+        // direction that produces a path Explorer cannot open.
+        let root = std::path::Path::new("C:\\mnt");
+        let with_emoji = full_length(root, "bundle.zip", "\u{1F600}.txt");
+        let with_ascii = full_length(root, "bundle.zip", "a.txt");
+        assert_eq!(
+            with_emoji,
+            with_ascii + 1,
+            "the emoji costs 2 units, 'a' costs 1"
+        );
+    }
+
+    /// A temp "drive" with a volume marker and `bundle.zip` catalogued as an archive holding `entries`.
+    fn fixture_with_entries(entries: &[(&str, i64, &str)]) -> (tempfile::TempDir, Catalog) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(crate::volume::MARKER), "vol-1").unwrap();
+        let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
+        cat.upsert_volume(&crate::catalog::models::Volume {
+            volume_id: "vol-1".into(),
+            label: "T".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+        for (chain, size, hash) in entries {
+            cat.upsert_archive_entry(
+                "vol-1",
+                "bundle.zip",
+                &crate::archive::ArchiveEntry {
+                    container_chain: (*chain).to_string(),
+                    filename: chain.rsplit('/').next().unwrap().to_string(),
+                    extension: "txt".into(),
+                    size_bytes: *size,
+                    content_hash: (*hash).to_string(),
+                },
+                None,
+                1,
+            )
+            .unwrap();
+        }
+        (tmp, cat)
+    }
+
+    #[test]
+    fn an_archive_whose_entries_all_fit_is_in_scope() {
+        let (tmp, cat) = fixture_with_entries(&[("small.txt", 4, "h1")]);
+        match scope_check(&cat, tmp.path(), "vol-1", "bundle.zip").unwrap() {
+            Scope::InScope {
+                entries,
+                uncompressed_bytes,
+            } => {
+                assert_eq!(entries, 1);
+                assert_eq!(uncompressed_bytes, 4);
+            }
+            Scope::Refused(r) => panic!("expected in scope, got {r}"),
+        }
+    }
+
+    #[test]
+    fn one_over_long_entry_refuses_the_whole_archive_and_names_it() {
+        let long = format!("{}/x.txt", "d".repeat(300));
+        let (tmp, cat) = fixture_with_entries(&[(long.as_str(), 4, "h1")]);
+        match scope_check(&cat, tmp.path(), "vol-1", "bundle.zip").unwrap() {
+            Scope::Refused(r) => {
+                assert!(r.contains("260"), "refusal must state the limit: {r}");
+                assert!(r.contains("x.txt"), "refusal must name the entry: {r}");
+            }
+            Scope::InScope { .. } => panic!("300-character entry must be refused"),
+        }
+    }
+
+    #[test]
+    fn an_existing_destination_folder_refuses_rather_than_merging() {
+        let (tmp, cat) = fixture_with_entries(&[("a.txt", 4, "h1")]);
+        std::fs::create_dir_all(tmp.path().join("bundle")).unwrap();
+        match scope_check(&cat, tmp.path(), "vol-1", "bundle.zip").unwrap() {
+            Scope::Refused(r) => assert!(r.contains("bundle"), "refusal must name the folder: {r}"),
+            Scope::InScope { .. } => panic!("must never merge into an existing folder"),
+        }
+    }
+
+    #[test]
+    fn an_archive_with_no_catalogued_entries_is_refused() {
+        let (tmp, cat) = fixture_with_entries(&[]);
+        match scope_check(&cat, tmp.path(), "vol-1", "bundle.zip").unwrap() {
+            Scope::Refused(r) => assert!(r.contains("no catalogued entries"), "{r}"),
+            Scope::InScope { .. } => panic!("nothing to verify against means nothing to extract"),
+        }
     }
 }
