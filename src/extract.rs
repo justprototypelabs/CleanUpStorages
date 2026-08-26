@@ -6,6 +6,7 @@
 //! is written, and every failure after that point deletes the destination and leaves the archive
 //! exactly where it was.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
@@ -253,6 +254,71 @@ pub fn write_level(
         written.push(name);
     }
     Ok(written)
+}
+
+/// Re-derive every catalogued chain from what is now on disk and compare hashes. Loose files are
+/// hashed directly; a nested archive that was written as a file is descended into with the
+/// scanner's own reader, so its chains come out identical to the ones already catalogued.
+///
+/// This is the step that makes quarantining the original safe. Without it, the original is removed
+/// on nothing but the assumption that the extraction worked.
+pub fn verify_destination(
+    cat: &Catalog,
+    volume_id: &str,
+    archive_rel: &str,
+    dest_abs: &Path,
+    limits: &crate::archive::ArchiveLimits,
+) -> anyhow::Result<()> {
+    // chain -> hash, as it exists on disk right now.
+    let mut found: HashMap<String, String> = HashMap::new();
+    for entry in walkdir::WalkDir::new(dest_abs)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let rel = entry
+            .path()
+            .strip_prefix(dest_abs)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let ext = rel
+            .rsplit('/')
+            .next()
+            .and_then(|l| l.rsplit_once('.'))
+            .map(|(_, e)| e.to_ascii_lowercase())
+            .unwrap_or_default();
+
+        let descend = matches!(
+            crate::archive::descent_for(&ext, &limits.deny_extensions, &limits.allow_extensions),
+            crate::archive::Descent::Descend
+        );
+        if descend {
+            let f = std::fs::File::open(entry.path())?;
+            let scanned = crate::archive::scan_archive(std::io::BufReader::new(f), limits);
+            for e in scanned.entries {
+                found.insert(
+                    format!("{rel}{}{}", CHAIN_SEP, e.container_chain),
+                    e.content_hash,
+                );
+            }
+        }
+        // A descendable archive is ALSO a file in its own right; record it either way, because a
+        // catalogued entry may point at the archive itself when the scanner stopped at max depth.
+        found.insert(rel, crate::hashing::hash_file(entry.path())?);
+    }
+
+    for row in cat.archive_entries(volume_id, archive_rel)? {
+        let chain = row.container_chain.clone().unwrap_or_default();
+        match found.get(&chain) {
+            None => anyhow::bail!("extracted content is missing the catalogued entry {chain}"),
+            Some(h) if h != &row.content_hash => anyhow::bail!(
+                "hash mismatch for {chain}: catalogue {}, extracted {h}",
+                row.content_hash
+            ),
+            Some(_) => {}
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -504,9 +570,10 @@ mod tests {
         );
     }
 
-    /// A temp "drive" with a volume marker and `bundle.zip` catalogued as an archive holding `entries`.
-    fn fixture_with_entries(entries: &[(&str, i64, &str)]) -> (tempfile::TempDir, Catalog) {
-        let tmp = tempfile::tempdir().unwrap();
+    /// A catalogue for a temp "drive" (volume marker already written into `tmp`) with `bundle.zip`
+    /// catalogued as an archive holding `entries`. The temp dir is passed in rather than created so
+    /// callers can also populate the destination folder inside the same directory.
+    fn catalog_with_entries(tmp: &tempfile::TempDir, entries: &[(&str, i64, &str)]) -> Catalog {
         std::fs::write(tmp.path().join(crate::volume::MARKER), "vol-1").unwrap();
         let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
         cat.upsert_volume(&crate::catalog::models::Volume {
@@ -533,12 +600,13 @@ mod tests {
             )
             .unwrap();
         }
-        (tmp, cat)
+        cat
     }
 
     #[test]
     fn an_archive_whose_entries_all_fit_is_in_scope() {
-        let (tmp, cat) = fixture_with_entries(&[("small.txt", 4, "h1")]);
+        let tmp = tempfile::tempdir().unwrap();
+        let cat = catalog_with_entries(&tmp, &[("small.txt", 4, "h1")]);
         match scope_check(&cat, tmp.path(), "vol-1", "bundle.zip").unwrap() {
             Scope::InScope {
                 entries,
@@ -554,7 +622,8 @@ mod tests {
     #[test]
     fn one_over_long_entry_refuses_the_whole_archive_and_names_it() {
         let long = format!("{}/x.txt", "d".repeat(300));
-        let (tmp, cat) = fixture_with_entries(&[(long.as_str(), 4, "h1")]);
+        let tmp = tempfile::tempdir().unwrap();
+        let cat = catalog_with_entries(&tmp, &[(long.as_str(), 4, "h1")]);
         match scope_check(&cat, tmp.path(), "vol-1", "bundle.zip").unwrap() {
             Scope::Refused(r) => {
                 assert!(r.contains("260"), "refusal must state the limit: {r}");
@@ -566,7 +635,8 @@ mod tests {
 
     #[test]
     fn an_existing_destination_folder_refuses_rather_than_merging() {
-        let (tmp, cat) = fixture_with_entries(&[("a.txt", 4, "h1")]);
+        let tmp = tempfile::tempdir().unwrap();
+        let cat = catalog_with_entries(&tmp, &[("a.txt", 4, "h1")]);
         std::fs::create_dir_all(tmp.path().join("bundle")).unwrap();
         match scope_check(&cat, tmp.path(), "vol-1", "bundle.zip").unwrap() {
             Scope::Refused(r) => assert!(r.contains("bundle"), "refusal must name the folder: {r}"),
@@ -576,10 +646,101 @@ mod tests {
 
     #[test]
     fn an_archive_with_no_catalogued_entries_is_refused() {
-        let (tmp, cat) = fixture_with_entries(&[]);
+        let tmp = tempfile::tempdir().unwrap();
+        let cat = catalog_with_entries(&tmp, &[]);
         match scope_check(&cat, tmp.path(), "vol-1", "bundle.zip").unwrap() {
             Scope::Refused(r) => assert!(r.contains("no catalogued entries"), "{r}"),
             Scope::InScope { .. } => panic!("nothing to verify against means nothing to extract"),
         }
+    }
+
+    /// Build a catalogue whose `bundle.zip` holds `files`, and a destination folder already
+    /// containing them -- i.e. the state immediately after `write_level` succeeded.
+    fn extracted_fixture(
+        tmp: &tempfile::TempDir,
+        files: &[(&str, &[u8])],
+    ) -> (Catalog, std::path::PathBuf) {
+        let entries: Vec<(String, i64, String)> = files
+            .iter()
+            .map(|(n, b)| {
+                (
+                    (*n).to_string(),
+                    b.len() as i64,
+                    blake3::hash(b).to_hex().to_string(),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, i64, &str)> = entries
+            .iter()
+            .map(|(n, s, h)| (n.as_str(), *s, h.as_str()))
+            .collect();
+        let cat = catalog_with_entries(tmp, &refs);
+        let dest = tmp.path().join("bundle");
+        for (name, bytes) in files {
+            let p = dest.join(name);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, bytes).unwrap();
+        }
+        (cat, dest)
+    }
+
+    /// `bundle.zip` (already extracted one level) holds `inner.zip` on disk, and `inner.zip` holds
+    /// `deep.txt` -- but the catalogue has no row for `inner.zip` itself, only the flattened chain
+    /// `inner.zip › deep.txt`, exactly as the scanner would have recorded it.
+    fn nested_extracted_fixture(tmp: &tempfile::TempDir) -> (Catalog, std::path::PathBuf) {
+        let deep = b"DEEP CONTENT";
+        let hash = blake3::hash(deep).to_hex().to_string();
+        let chain = format!("inner.zip{CHAIN_SEP}deep.txt");
+        let cat = catalog_with_entries(tmp, &[(chain.as_str(), deep.len() as i64, hash.as_str())]);
+
+        let dest = tmp.path().join("bundle");
+        std::fs::create_dir_all(&dest).unwrap();
+        write_zip(&dest.join("inner.zip"), &[("deep.txt", deep)]);
+        (cat, dest)
+    }
+
+    #[test]
+    fn verification_passes_when_every_catalogued_hash_is_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cat, dest) = extracted_fixture(&tmp, &[("a.txt", b"AAA")]);
+        verify_destination(&cat, "vol-1", "bundle.zip", &dest, &test_limits()).unwrap();
+    }
+
+    #[test]
+    fn verification_fails_loudly_on_a_content_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cat, dest) = extracted_fixture(&tmp, &[("a.txt", b"AAA")]);
+        std::fs::write(dest.join("a.txt"), b"TAMPERED").unwrap();
+
+        let err =
+            verify_destination(&cat, "vol-1", "bundle.zip", &dest, &test_limits()).unwrap_err();
+        assert!(
+            format!("{err}").contains("a.txt"),
+            "must name the entry: {err}"
+        );
+        assert!(
+            format!("{err}").contains("hash"),
+            "must say what failed: {err}"
+        );
+    }
+
+    #[test]
+    fn verification_fails_when_a_catalogued_entry_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cat, dest) = extracted_fixture(&tmp, &[("a.txt", b"AAA")]);
+        std::fs::remove_file(dest.join("a.txt")).unwrap();
+
+        let err =
+            verify_destination(&cat, "vol-1", "bundle.zip", &dest, &test_limits()).unwrap_err();
+        assert!(format!("{err}").contains("missing"), "{err}");
+    }
+
+    #[test]
+    fn a_nested_archive_is_verified_through_its_contents() {
+        // bundle.zip contains inner.zip contains deep.txt. After one level, only inner.zip is on
+        // disk -- and that is enough to prove the catalogued chain "inner.zip › deep.txt".
+        let tmp = tempfile::tempdir().unwrap();
+        let (cat, dest) = nested_extracted_fixture(&tmp);
+        verify_destination(&cat, "vol-1", "bundle.zip", &dest, &test_limits()).unwrap();
     }
 }
