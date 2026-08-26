@@ -207,7 +207,12 @@ pub fn write_level(
         // `Component::Normal` catches `Prefix`, `RootDir`, `CurDir` and `ParentDir` uniformly, on
         // both platforms. The zip spec defines entry names as `/`-separated, so a literal `\` is a
         // lying name regardless of what `components()` makes of it -- kept as an explicit check.
-        let escapes = name.contains('\\')
+        // An EMPTY name is also checked explicitly: `Path::new("").components()` yields no
+        // components at all, so `.all(..)` over it is vacuously true and would let an empty name
+        // through -- which `dest_abs.join("")` resolves to `dest_abs` itself, i.e. the extractor
+        // would try to write a file entry directly onto the destination directory.
+        let escapes = name.is_empty()
+            || name.contains('\\')
             || !Path::new(&name)
                 .components()
                 .all(|c| matches!(c, std::path::Component::Normal(_)));
@@ -328,6 +333,80 @@ mod tests {
         assert!(
             !tmp.path().join("evil.txt").exists(),
             "drive-relative zip-slip must write nothing"
+        );
+    }
+
+    #[test]
+    fn write_level_refuses_an_empty_entry_name() {
+        // `Path::new("").components()` yields NO components, so `.all(..)` over an empty iterator
+        // is vacuously true -- the components()-only guard would let an empty name through, and
+        // `dest_abs.join("")` resolves to `dest_abs` itself, i.e. the extractor would try to write
+        // a file entry directly onto the destination directory. This is not a hypothetical: the
+        // `zip` crate itself refuses to CREATE an entry named "", so this test builds the zip's raw
+        // bytes by hand to prove the guard still catches a name a crafted (not this tool's own)
+        // archive could carry.
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("evil3.zip");
+
+        // `zip::write::FileOptions::start_file("", ..)` panics/errors in this crate version, so an
+        // empty-named entry cannot be produced through the writer API -- confirmed by hand before
+        // writing this test. Build the archive by hand: one stored, zero-length local file header
+        // with a zero-length name, followed by a matching zero-length-name central directory record
+        // and EOCD, per the ZIP local/central file header layout (APPNOTE.TXT 4.3.7 / 4.3.12).
+        let mut bytes = Vec::new();
+        let lfh_start = bytes.len() as u32;
+        bytes.extend_from_slice(&0x04034b50u32.to_le_bytes()); // local file header signature
+        bytes.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // flags
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // method: stored
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // mod date
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // crc32 (empty content)
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // compressed size
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // uncompressed size
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // name length: 0
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // extra length: 0
+                                                      // name (empty), extra (empty), data (empty) -- nothing to append
+
+        let cdh_start = bytes.len() as u32;
+        bytes.extend_from_slice(&0x02014b50u32.to_le_bytes()); // central directory signature
+        bytes.extend_from_slice(&20u16.to_le_bytes()); // version made by
+        bytes.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // flags
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // method: stored
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // mod date
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // crc32
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // compressed size
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // uncompressed size
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // name length: 0
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // extra length: 0
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // comment length: 0
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // disk number start
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+        bytes.extend_from_slice(&lfh_start.to_le_bytes()); // local header offset
+                                                           // name (empty)
+        let cdh_len = (bytes.len() as u32) - cdh_start;
+
+        bytes.extend_from_slice(&0x06054b50u32.to_le_bytes()); // EOCD signature
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // disk number
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // disk with central dir
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // entries on this disk
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // total entries
+        bytes.extend_from_slice(&cdh_len.to_le_bytes()); // central dir size
+        bytes.extend_from_slice(&cdh_start.to_le_bytes()); // central dir offset
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // comment length: 0
+
+        std::fs::write(&zip_path, &bytes).unwrap();
+
+        let dest = tmp.path().join("evil3");
+
+        let err = write_level(&zip_path, &dest, &test_limits()).unwrap_err();
+        assert!(format!("{err}").contains("escapes"), "got: {err}");
+        assert!(
+            !dest.exists(),
+            "empty-name zip-slip must write nothing onto the destination path"
         );
     }
 
