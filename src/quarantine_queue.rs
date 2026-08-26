@@ -94,6 +94,10 @@ struct Inner {
     pending: VecDeque<Job>,
     running: Option<Job>,
     recent: VecDeque<QuarantineResult>,
+    /// Volumes mutated since the last drain. The rebuild at the end of a run has to cover all of
+    /// them: a review session that quarantines on both drives would otherwise leave the first
+    /// drive's directory index describing folders that have already moved.
+    touched: std::collections::HashSet<String>,
 }
 
 impl Inner {
@@ -138,6 +142,7 @@ impl QuarantineQueue {
                 pending: VecDeque::new(),
                 running: None,
                 recent: VecDeque::new(),
+                touched: std::collections::HashSet::new(),
             }),
             notify: tokio::sync::Notify::new(),
         })
@@ -310,30 +315,42 @@ impl QuarantineQueue {
             },
         };
 
-        let drained = {
+        let (drained, touched) = {
             let mut inner = self.inner.lock().unwrap();
             inner.running = None;
+            inner.touched.insert(volume_id.clone());
             inner.recent.push_front(result);
             while inner.recent.len() > RECENT_CAP {
                 inner.recent.pop_back();
             }
-            inner.pending.is_empty()
+            let drained = inner.pending.is_empty();
+            let touched = if drained {
+                std::mem::take(&mut inner.touched)
+            } else {
+                std::collections::HashSet::new()
+            };
+            (drained, touched)
         };
 
         // Rebuild ONCE, when there is nothing left to do. Rebuilding per item meant reprocessing
         // every row in the catalogue for each folder moved; the review list is stale in exactly the
         // same way after one item or twenty, so the work only needs doing when the user is about to
-        // look again. Task 3 widens this to every volume the queue touched.
+        // look again.
         if drained {
             let catalog_path = self.catalog_path.clone();
-            let vid = volume_id.clone();
             let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 let cat = crate::catalog::Catalog::open(&catalog_path)?;
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)?
                     .as_secs() as i64;
-                cat.rebuild_directory_trees(&vid, now)?;
-                cat.refresh_volume_totals(&vid)?;
+                for vid in &touched {
+                    cat.rebuild_directory_trees(vid, now)?;
+                    cat.refresh_volume_totals(vid)?;
+                }
+                drop(cat);
+                // Best-effort: a failed snapshot must not look like a failed quarantine. The
+                // quarantine already happened and is already recorded.
+                let _ = crate::catalog::backup::snapshot_beside(&catalog_path, now);
                 Ok(())
             })
             .await;
@@ -542,6 +559,112 @@ mod tests {
         assert_eq!(r.files_updated, 1, "one copy moved");
         assert_eq!(r.skipped, 1, "the last copy was protected");
         assert!(r.error_message.is_none(), "a guarded skip is not a failure");
+    }
+
+    #[tokio::test]
+    async fn a_queue_spanning_two_drives_rebuilds_both_indexes() {
+        // Today the drain rebuilds the LAST job's volume only. With files jobs enqueued per volume,
+        // a review session touching both drives leaves one drive's directory index stale, and the
+        // review list then shows folders that have already moved.
+        let (_t, drive, q) = fake_drive();
+        // A second volume on the same catalogue, with its own marker and its own duplicate pair.
+        let drive_b = _t.path().join("driveB");
+        std::fs::create_dir_all(drive_b.join("copy")).unwrap();
+        std::fs::write(drive_b.join(".cleanupstorages_id"), "vol-2").unwrap();
+        std::fs::write(drive_b.join("b.txt"), b"OTHER").unwrap();
+        std::fs::write(drive_b.join("copy/b.txt"), b"OTHER").unwrap();
+        {
+            let cat = crate::catalog::Catalog::open(q.catalog_path_for_test()).unwrap();
+            cat.upsert_volume(&crate::catalog::models::Volume {
+                volume_id: "vol-2".into(),
+                label: "E".into(),
+                identified_by: "marker".into(),
+                first_seen_at: 1,
+                last_seen_at: 1,
+            })
+            .unwrap();
+            let mk = |path: &str| crate::catalog::models::NewFile {
+                volume_id: "vol-2".into(),
+                relative_path: path.into(),
+                filename: path.rsplit('/').next().unwrap().into(),
+                extension: "txt".into(),
+                size_bytes: 5,
+                content_hash: "OTHERHASH".into(),
+                created_time: None,
+                modified_time: None,
+                accessed_time: None,
+                category: crate::category::Category::Document,
+                container_chain: None,
+            };
+            cat.upsert_file(&mk("b.txt"), 100).unwrap();
+            cat.upsert_file(&mk("copy/b.txt"), 100).unwrap();
+            cat.rebuild_directory_trees("vol-2", 100).unwrap();
+        }
+        let mut mounts = std::collections::HashMap::new();
+        mounts.insert("vol-1".to_string(), drive);
+        mounts.insert("vol-2".to_string(), drive_b);
+        let q = QuarantineQueue::new(
+            q.catalog_path_for_test().to_path_buf(),
+            crate::mounts::MountResolver::Fixed(mounts),
+        );
+        let a = {
+            let cat = crate::catalog::Catalog::open_readonly(q.catalog_path_for_test()).unwrap();
+            cat.loose_file_id("vol-1", "copy/a.txt").unwrap().unwrap()
+        };
+        let b = {
+            let cat = crate::catalog::Catalog::open_readonly(q.catalog_path_for_test()).unwrap();
+            cat.loose_file_id("vol-2", "copy/b.txt").unwrap().unwrap()
+        };
+
+        tokio::spawn(q.clone().run_worker());
+        q.enqueue_files("vol-1".into(), vec![a]);
+        q.enqueue_files("vol-2".into(), vec![b]);
+        for _ in 0..400 {
+            let s = q.status();
+            if s.running.is_none() && s.pending.is_empty() && s.recent.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // vol-1 ran FIRST, so it is the one today's code forgets to rebuild.
+        let cat = crate::catalog::Catalog::open_readonly(q.catalog_path_for_test()).unwrap();
+        let stale = cat
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM directory_trees WHERE volume_id='vol-1' AND path='copy'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stale, 0,
+            "vol-1's index must be rebuilt too, not just the last job's volume"
+        );
+    }
+
+    #[tokio::test]
+    async fn draining_writes_a_catalogue_snapshot() {
+        // The synchronous handler used to snapshot after every mutating request. Moving the work to
+        // the worker moved that responsibility with it, and folder quarantines — which never
+        // snapshotted at all — gain the same net.
+        let (_t, _drive, q) = fake_drive();
+        let victim = loose_id(&q, "copy/a.txt");
+        tokio::spawn(q.clone().run_worker());
+        q.enqueue_files("vol-1".into(), vec![victim]);
+        drain(&q).await;
+        for _ in 0..200 {
+            let backups = q
+                .catalog_path_for_test()
+                .parent()
+                .unwrap()
+                .join("catalog.backups");
+            if std::fs::read_dir(&backups).map(|d| d.count()).unwrap_or(0) > 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("draining the queue must snapshot the catalogue it mutated");
     }
 
     #[tokio::test]
