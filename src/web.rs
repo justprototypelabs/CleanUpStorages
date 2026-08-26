@@ -1172,7 +1172,7 @@ async fn api_quarantine_tree(
     check_csrf(&headers, &state)?;
     let position = state
         .quarantine_queue
-        .enqueue(body.volume_id.clone(), body.path.clone());
+        .enqueue_tree(body.volume_id.clone(), body.path.clone());
     Ok(Json(QuarantineQueuedDto {
         queued: true,
         position,
