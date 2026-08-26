@@ -198,14 +198,20 @@ pub fn write_level(
         }
         let name = entry.name().to_string();
 
-        // Zip slip: a crafted name must never write outside the destination. Checked on the
-        // components, not on the string, so `a/../../b` is caught as well as a leading `..`.
-        if name
-            .split('/')
-            .any(|c| c == ".." || c == "." || c.is_empty())
-            || name.contains('\\')
-            || Path::new(&name).is_absolute()
-        {
+        // Zip slip: a crafted name must never write outside the destination. Checked via
+        // `Path::components()` rather than ad-hoc string matching: `..`/`.`/empty segments are
+        // one case, but on Windows a drive-relative name like `C:evil.txt` has no `..` and is not
+        // `is_absolute()` either (a prefix with no root) -- yet `PathBuf::push` documents that
+        // joining such a path REPLACES the base rather than appending to it, so `dest_abs.join`
+        // would silently escape the destination entirely. Rejecting every component that is not
+        // `Component::Normal` catches `Prefix`, `RootDir`, `CurDir` and `ParentDir` uniformly, on
+        // both platforms. The zip spec defines entry names as `/`-separated, so a literal `\` is a
+        // lying name regardless of what `components()` makes of it -- kept as an explicit check.
+        let escapes = name.contains('\\')
+            || !Path::new(&name)
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)));
+        if escapes {
             anyhow::bail!("entry name escapes the destination folder: {name}");
         }
 
@@ -302,6 +308,26 @@ mod tests {
         assert!(
             !tmp.path().join("escaped.txt").exists(),
             "zip-slip must write nothing"
+        );
+    }
+
+    #[test]
+    fn write_level_refuses_a_windows_drive_relative_entry_name() {
+        // `C:evil.txt` has no `..` and Path::is_absolute() is false for it (a prefix with no
+        // root), but PathBuf::push documents that joining such a path REPLACES the base path
+        // rather than appending to it -- so `dest_abs.join("C:evil.txt")` would silently discard
+        // `dest_abs` entirely on Windows. This is the exact bypass the components() check exists
+        // to catch.
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("evil2.zip");
+        write_zip(&zip_path, &[("C:evil.txt", b"NOPE")]);
+        let dest = tmp.path().join("evil2");
+
+        let err = write_level(&zip_path, &dest, &test_limits()).unwrap_err();
+        assert!(format!("{err}").contains("escapes"), "got: {err}");
+        assert!(
+            !tmp.path().join("evil.txt").exists(),
+            "drive-relative zip-slip must write nothing"
         );
     }
 
