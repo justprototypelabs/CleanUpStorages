@@ -717,24 +717,35 @@ mod tests {
         tokio::spawn(q.clone().run_worker());
         q.enqueue_files("vol-1".into(), vec![a]);
         q.enqueue_files("vol-2".into(), vec![b]);
+
+        // Poll the EFFECT this test asserts -- vol-1's stale row disappearing -- and never a proxy
+        // for it. `run_job` clears `running` and pushes its result into `recent` INSIDE the lock,
+        // then awaits the rebuild afterwards, so a queue that merely looks idle can still have the
+        // rebuild in flight. Waiting on "idle with two results" is therefore a race: it passed
+        // locally and on macOS, where the rebuild won, and failed on the slower Windows runner.
+        //
+        // The failing-before-the-fix property is preserved: if the drain went back to rebuilding
+        // only the last job's volume, this loop would exhaust its budget with `stale` still 1 and
+        // the assertion below would still fail -- just slower.
+        let read_stale = || {
+            let cat = crate::catalog::Catalog::open_readonly(q.catalog_path_for_test()).unwrap();
+            cat.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM directory_trees WHERE volume_id='vol-1' AND path='copy'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        // vol-1 ran FIRST, so it is the one the old code forgot to rebuild.
+        let mut stale = read_stale();
         for _ in 0..400 {
-            let s = q.status();
-            if s.running.is_none() && s.pending.is_empty() && s.recent.len() == 2 {
+            if stale == 0 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            stale = read_stale();
         }
-
-        // vol-1 ran FIRST, so it is the one today's code forgets to rebuild.
-        let cat = crate::catalog::Catalog::open_readonly(q.catalog_path_for_test()).unwrap();
-        let stale = cat
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM directory_trees WHERE volume_id='vol-1' AND path='copy'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap();
         assert_eq!(
             stale, 0,
             "vol-1's index must be rebuilt too, not just the last job's volume"
