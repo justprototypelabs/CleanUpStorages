@@ -6,6 +6,7 @@
 //! is written, and every failure after that point deletes the destination and leaves the archive
 //! exactly where it was.
 
+use std::io::Read;
 use std::path::Path;
 
 use crate::catalog::Catalog;
@@ -175,9 +176,150 @@ pub fn scope_check(
     })
 }
 
+/// Write every file entry of ONE archive level into `dest_abs`, recreating the archive's own
+/// layout: a nested archive lands as a file, not as a folder. Returns the destination-relative
+/// paths written, so the caller can clean up precisely and verify what it asked for.
+///
+/// Any error leaves cleanup to the caller (`extract_archive` deletes the whole destination), which
+/// is why this function never tries to unwind half of its own work.
+pub fn write_level(
+    archive_path: &Path,
+    dest_abs: &Path,
+    limits: &crate::archive::ArchiveLimits,
+) -> anyhow::Result<Vec<String>> {
+    let file = std::fs::File::open(archive_path)?;
+    let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file))?;
+    let mut written = Vec::new();
+
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        if !entry.is_file() {
+            continue;
+        }
+        let name = entry.name().to_string();
+
+        // Zip slip: a crafted name must never write outside the destination. Checked on the
+        // components, not on the string, so `a/../../b` is caught as well as a leading `..`.
+        if name
+            .split('/')
+            .any(|c| c == ".." || c == "." || c.is_empty())
+            || name.contains('\\')
+            || Path::new(&name).is_absolute()
+        {
+            anyhow::bail!("entry name escapes the destination folder: {name}");
+        }
+
+        let declared = entry.size();
+        let compressed = entry.compressed_size().max(1);
+        if declared / compressed > limits.ratio_cap {
+            anyhow::bail!(
+                "entry {name} declares a {}:1 ratio, over the cap {}",
+                declared / compressed,
+                limits.ratio_cap
+            );
+        }
+
+        let out_path = dest_abs.join(&name);
+        if let Some(p) = out_path.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&out_path)?);
+        let cap = limits.entry_max_bytes.unwrap_or(u64::MAX);
+        let mut buf = [0u8; 64 * 1024];
+        let mut total: u64 = 0;
+        loop {
+            let n = entry.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            if total > cap {
+                anyhow::bail!("entry {name} exceeds the size cap {cap} bytes");
+            }
+            std::io::Write::write_all(&mut out, &buf[..n])?;
+        }
+        std::io::Write::flush(&mut out)?;
+        written.push(name);
+    }
+    Ok(written)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_limits() -> crate::archive::ArchiveLimits {
+        crate::archive::ArchiveLimits {
+            max_depth: 8,
+            buffer_max_bytes: 2 * 1024 * 1024 * 1024,
+            total_buffer_bytes: 2 * 1024 * 1024 * 1024,
+            entry_max_bytes: Some(64 * 1024 * 1024 * 1024),
+            ratio_cap: 10_000,
+            deny_extensions: crate::config::DEFAULT_DENY
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            allow_extensions: Vec::new(),
+        }
+    }
+
+    fn write_zip(path: &Path, files: &[(&str, &[u8])]) {
+        use std::io::Write;
+        let f = std::fs::File::create(path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts: zip::write::FileOptions<()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, bytes) in files {
+            zw.start_file(*name, opts).unwrap();
+            zw.write_all(bytes).unwrap();
+        }
+        zw.finish().unwrap();
+    }
+
+    #[test]
+    fn write_level_recreates_the_archive_layout_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("bundle.zip");
+        write_zip(&zip_path, &[("a.txt", b"AAA"), ("sub/b.txt", b"BBB")]);
+        let dest = tmp.path().join("bundle");
+
+        let written = write_level(&zip_path, &dest, &test_limits()).unwrap();
+
+        assert_eq!(written, vec!["a.txt".to_string(), "sub/b.txt".to_string()]);
+        assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"AAA");
+        assert_eq!(std::fs::read(dest.join("sub/b.txt")).unwrap(), b"BBB");
+    }
+
+    #[test]
+    fn write_level_refuses_a_path_that_escapes_the_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("evil.zip");
+        write_zip(&zip_path, &[("../escaped.txt", b"NOPE")]);
+        let dest = tmp.path().join("evil");
+
+        let err = write_level(&zip_path, &dest, &test_limits()).unwrap_err();
+        assert!(format!("{err}").contains("escapes"), "got: {err}");
+        assert!(
+            !tmp.path().join("escaped.txt").exists(),
+            "zip-slip must write nothing"
+        );
+    }
+
+    #[test]
+    fn write_level_honours_the_entry_size_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("big.zip");
+        write_zip(&zip_path, &[("big.bin", &vec![7u8; 4096])]);
+        let dest = tmp.path().join("big");
+        let mut limits = test_limits();
+        limits.entry_max_bytes = Some(1024);
+
+        let err = write_level(&zip_path, &dest, &limits).unwrap_err();
+        assert!(
+            format!("{err}").contains("1024"),
+            "must report the cap: {err}"
+        );
+    }
 
     #[test]
     fn destination_is_a_sibling_folder_named_after_the_stem() {
