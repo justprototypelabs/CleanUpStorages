@@ -62,7 +62,9 @@ Actionable work is tracked as **GitHub issues** (`gh issue list`), not scattered
 
 - **Epics** — large features or themes — use GitHub **sub-issues** to hold their child tasks. Each
   child is a normal issue nested under the epic, so the epic shows live progress. Create epics with
-  the `epic` label; link children with `gh api repos/OWNER/REPO/issues/PARENT/sub_issues -f sub_issue_id=CHILD_ID`.
+  the `epic` label; link children with `gh api repos/OWNER/REPO/issues/PARENT/sub_issues -F sub_issue_id=CHILD_ID`
+  (`-F`, not `-f`: the API wants an integer and `-f` sends a string, which fails with a 422). The id
+  is the issue's **database id**, not its number — `gh api repos/OWNER/REPO/issues/N --jq .id`.
 - **Where things live:** near-term/committed work → GitHub issues. Long-tail research / "someday"
   ideas stay in [docs/future-ideas.md](docs/future-ideas.md) until one is picked up, at which point
   it graduates into an issue (and, if substantial, its own spec + plan).

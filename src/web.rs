@@ -25,7 +25,8 @@ pub struct AppState {
     pub mounts: crate::mounts::MountResolver,
     pub csrf_token: String,
     pub scan_queue: std::sync::Arc<crate::scan_queue::ScanQueue>,
-    /// Serial worker for folder quarantines, so confirming one does not block the next (#66).
+    /// Serial worker for folder and single-file quarantines, so confirming one does not block
+    /// the next (#66).
     pub quarantine_queue: std::sync::Arc<crate::quarantine_queue::QuarantineQueue>,
 }
 
@@ -911,73 +912,68 @@ struct QuarantineReq {
 }
 
 #[derive(Serialize, Default)]
-struct QuarantineResultDto {
-    quarantined: usize,
+struct QuarantineQueuedFilesDto {
+    /// How many of the requested ids are now queued for the worker (including any that a
+    /// previous click had already queued).
+    queued: usize,
+    /// Position of the last job enqueued; 0 means it starts next.
+    position: usize,
+    /// Ids that resolve to nothing, or that were already queued. Not an error.
     skipped: usize,
+    /// Volumes that are not currently mounted. Knowable now, so it is answered now rather than
+    /// leaving the reviewer to discover it from a status poll.
     unmounted_volumes: Vec<String>,
-    errors: Vec<String>,
 }
 
-/// The web app's first write endpoint. All destructive safety (marker check, disk-aware
-/// last-copy guard, rename-only) lives in `quarantine::quarantine_files`; this handler is just
-/// the CSRF gate plus grouping requested ids by volume so the engine can be called per-mount.
+/// Enqueue single-file quarantines and return immediately.
+///
+/// Returns an acknowledgement rather than an outcome. The work has not happened when this response
+/// is written, so reporting `quarantined`/`skipped` counts here would be a lie — those numbers
+/// arrive through `/api/quarantine/status` once the worker has run.
+///
+/// All destructive safety (marker check, disk-aware last-copy guard, rename-only) lives in
+/// `quarantine::quarantine_files` and runs inside the worker, immediately before it acts — which is
+/// the only point at which those checks are not already stale.
 async fn api_quarantine(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Json<QuarantineReq>,
-) -> Result<Json<QuarantineResultDto>, (StatusCode, String)> {
+) -> Result<Json<QuarantineQueuedFilesDto>, (StatusCode, String)> {
     check_csrf(&headers, &state)?;
 
-    let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
-    let now = now_secs()?;
+    let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
 
     // Group requested ids by their volume; ids that don't resolve to a file are counted skipped.
     let mut by_volume: std::collections::HashMap<String, Vec<i64>> =
         std::collections::HashMap::new();
-    let mut missing = 0usize;
+    let mut out = QuarantineQueuedFilesDto::default();
     for id in &body.quarantine_ids {
         match cat.get_file(*id).map_err(err500)? {
             Some(rec) => by_volume.entry(rec.volume_id).or_default().push(*id),
-            None => missing += 1,
+            None => out.skipped += 1,
         }
     }
 
-    let mut result = QuarantineResultDto::default();
-    result.skipped += missing;
     let mounts = state.mounts.snapshot();
     for (volume_id, ids) in by_volume {
-        if let Some(mount) = mounts.get(&volume_id) {
-            // Quarantine verifies content by re-hashing before it moves anything, so this can run
-            // for minutes on large files. Off the async worker, or the whole UI stops responding.
-            let (mount, vid, cat_path) =
-                (mount.clone(), volume_id.clone(), state.catalog_path.clone());
-            let ids2 = ids.clone();
-            let joined = tokio::task::spawn_blocking(move || {
-                let cat = Catalog::open(&cat_path)?;
-                crate::quarantine::quarantine_files(&cat, &mount, &vid, &ids2, now)
-            })
-            .await
-            .map_err(|e| err500(anyhow::anyhow!("quarantine task failed: {e}")))?;
-            match joined {
-                Ok(out) => {
-                    result.quarantined += out.quarantined;
-                    result.skipped += out.skipped;
-                }
-                Err(e) => {
-                    result.skipped += ids.len();
-                    result.errors.push(format!("{volume_id}: {e}"));
-                }
+        if !mounts.contains_key(&volume_id) {
+            out.skipped += ids.len();
+            out.unmounted_volumes.push(volume_id);
+            continue;
+        }
+        let n = ids.len();
+        match state.quarantine_queue.enqueue_files(volume_id, ids) {
+            Some(position) => {
+                out.queued += n;
+                out.position = position;
             }
-        } else {
-            result.skipped += ids.len();
-            result.unmounted_volumes.push(volume_id);
+            // Every id was already queued. Not a failure, and not something to report as an error:
+            // the reviewer double-clicked, and the decision is already on its way.
+            None => out.skipped += n,
         }
     }
 
-    // Snapshot the catalog this request actually mutated (best-effort; a snapshot failure
-    // shouldn't fail the request).
-    snapshot_best_effort(&state, now);
-    Ok(Json(result))
+    Ok(Json(out))
 }
 
 #[derive(Deserialize)]
@@ -1172,7 +1168,7 @@ async fn api_quarantine_tree(
     check_csrf(&headers, &state)?;
     let position = state
         .quarantine_queue
-        .enqueue(body.volume_id.clone(), body.path.clone());
+        .enqueue_tree(body.volume_id.clone(), body.path.clone());
     Ok(Json(QuarantineQueuedDto {
         queued: true,
         position,
@@ -2686,9 +2682,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quarantine_moves_the_chosen_copy() {
+    async fn quarantine_is_queued_and_the_worker_completes_it() {
+        // The POST now ENQUEUES rather than doing the work, so the reviewer can confirm the next
+        // group immediately instead of waiting out a re-hash (#66 for folders, this for files).
         let (_t, db, state) = seed_dupes();
-        // put real files on the fake drive so the disk-aware survivor check passes and the move works
         let drive = match &state.mounts {
             crate::mounts::MountResolver::Fixed(m) => m["vol-1"].clone(),
             _ => unreachable!(),
@@ -2696,32 +2693,47 @@ mod tests {
         std::fs::create_dir_all(drive.join("copy")).unwrap();
         std::fs::write(drive.join("a.jpg"), b"DUP").unwrap();
         std::fs::write(drive.join("copy/a.jpg"), b"DUP").unwrap();
-        let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
-        let victim = cat.loose_file_id("vol-1", "copy/a.jpg").unwrap().unwrap();
-        drop(cat);
+        let victim = {
+            let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
+            cat.loose_file_id("vol-1", "copy/a.jpg").unwrap().unwrap()
+        };
+        tokio::spawn(state.quarantine_queue.clone().run_worker());
 
         let (status, json) = post_json(
-            state,
+            state.clone(),
             "/api/quarantine",
             Some("T"),
-            serde_json::json!({"quarantine_ids":[victim]}),
+            serde_json::json!({ "quarantine_ids": [victim] }),
         )
         .await;
         assert_eq!(status, axum::http::StatusCode::OK);
-        assert_eq!(json["quarantined"], 1);
+        assert_eq!(json["queued"], 1, "one id accepted");
+        assert_eq!(json["position"], 0, "nothing ahead of it");
+
+        for _ in 0..400 {
+            if drive.join("_ToDelete/copy/a.jpg").is_file() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            drive.join("_ToDelete/copy/a.jpg").is_file(),
+            "the queued move must happen"
+        );
         assert!(!drive.join("copy/a.jpg").exists());
-        assert!(drive.join("_ToDelete/copy/a.jpg").exists());
-        assert!(drive.join("a.jpg").exists()); // survivor stays
+        assert!(drive.join("a.jpg").exists(), "survivor stays");
     }
 
     #[tokio::test]
-    async fn quarantine_reports_unmounted_volume_without_error() {
+    async fn quarantine_reports_an_unmounted_volume_without_queueing_it() {
+        // Whether a drive is plugged in IS knowable at request time, so the reviewer learns it from
+        // the response rather than from a poll thirty seconds later.
         let (_t, db, state) = seed_dupes();
         {
             let cat = crate::catalog::Catalog::open(&db).unwrap();
             cat.upsert_volume(&crate::catalog::models::Volume {
                 volume_id: "vol-2".into(),
-                label: "Offline".into(),
+                label: "Unplugged".into(),
                 identified_by: "marker".into(),
                 first_seen_at: 1,
                 last_seen_at: 1,
@@ -2733,8 +2745,8 @@ mod tests {
                     relative_path: "x.jpg".into(),
                     filename: "x.jpg".into(),
                     extension: "jpg".into(),
-                    size_bytes: 5,
-                    content_hash: "Z".into(),
+                    size_bytes: 3,
+                    content_hash: "DUPHASH".into(),
                     created_time: None,
                     modified_time: None,
                     accessed_time: None,
@@ -2745,23 +2757,39 @@ mod tests {
             )
             .unwrap();
         }
-        let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
-        let id = cat.loose_file_id("vol-2", "x.jpg").unwrap().unwrap();
-        drop(cat);
+        let id = {
+            let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
+            cat.loose_file_id("vol-2", "x.jpg").unwrap().unwrap()
+        };
         let (status, json) = post_json(
             state,
             "/api/quarantine",
             Some("T"),
-            serde_json::json!({"quarantine_ids":[id]}),
+            serde_json::json!({ "quarantine_ids": [id] }),
         )
         .await;
         assert_eq!(status, axum::http::StatusCode::OK);
-        assert_eq!(json["skipped"], 1);
+        assert_eq!(json["queued"], 0, "nothing could be queued");
         assert!(json["unmounted_volumes"]
             .as_array()
             .unwrap()
             .iter()
             .any(|v| v == "vol-2"));
+    }
+
+    #[tokio::test]
+    async fn quarantine_ids_that_do_not_resolve_are_reported_skipped() {
+        let (_t, _db, state) = seed_dupes();
+        let (status, json) = post_json(
+            state,
+            "/api/quarantine",
+            Some("T"),
+            serde_json::json!({ "quarantine_ids": [999_999] }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(json["skipped"], 1);
+        assert_eq!(json["queued"], 0);
     }
 
     #[tokio::test]
@@ -3095,6 +3123,90 @@ mod tests {
         assert!(
             !body.contains("http://") && !body.contains("https://"),
             "self-contained"
+        );
+    }
+
+    async fn get_text(state: AppState, uri: &str) -> String {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let app = build_router_with(state);
+        let res = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), 10_000_000)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn review_page_confirms_without_promising_a_wait() {
+        // The old copy said "Verifying content, then quarantining… (large files take a while)" —
+        // true when the request blocked, a lie now that it queues.
+        let (_t, _db, state) = seed_dupes();
+        let body = get_text(state, "/review").await;
+        assert!(
+            !body.contains("Verifying content"),
+            "the blocking wording must be gone"
+        );
+        assert!(
+            body.contains("Queued"),
+            "the reviewer is told it was queued"
+        );
+        assert!(
+            body.contains("st.running.label"),
+            "the poller reads label, not the removed path field"
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_button_is_disabled_for_the_duration_of_the_request() {
+        // F1: a double-click on Confirm used to run `idx++; render();` twice -- the server-side
+        // de-dup stops the file being queued twice, but nothing stopped the reviewer being
+        // advanced past a group they never saw. Disabling the button around the await (and
+        // re-enabling in a `finally`, so a thrown request cannot leave it dead forever) is what
+        // makes the second click a no-op instead of a second advance.
+        let (_t, _db, state) = seed_dupes();
+        let body = get_text(state, "/review").await;
+        let handler_start = body
+            .find("$(\"#confirm\").addEventListener")
+            .expect("confirm click handler must exist");
+        let handler_end = body[handler_start..]
+            .find("$(\"#skip\").addEventListener")
+            .map(|i| handler_start + i)
+            .expect("skip handler follows confirm handler");
+        let handler = &body[handler_start..handler_end];
+        assert!(
+            handler.contains("$(\"#confirm\").disabled=true"),
+            "the button must be disabled before the request is sent"
+        );
+        assert!(
+            handler.contains("finally"),
+            "re-enabling must happen in a finally so a thrown request can't leave it dead"
+        );
+        assert!(
+            handler.contains("$(\"#confirm\").disabled=false"),
+            "the button must be re-enabled once the request settles"
+        );
+    }
+
+    #[tokio::test]
+    async fn skipped_wording_does_not_claim_a_cause_it_cannot_back_up() {
+        // F3: `quarantine_files` increments `skipped` for five different reasons -- only one of
+        // them is the last-copy guard. Wording it as "kept by the last-copy guard" reports an I/O
+        // error on the user's drive as the safety guard working correctly, which is the wrong
+        // direction to be wrong in.
+        let (_t, _db, state) = seed_dupes();
+        let body = get_text(state, "/review").await;
+        assert!(
+            !body.contains("last-copy guard"),
+            "must not claim the last-copy guard specifically -- skipped has four other causes"
+        );
+        assert!(
+            body.contains("kept (not moved"),
+            "must use wording that does not assert a cause"
         );
     }
 
@@ -4076,10 +4188,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_mutation_snapshots_beside_its_own_catalogue_not_the_ambient_one() {
-        // #44: snapshot_best_effort used to resolve Config::default_paths(), so a request that
-        // mutated a temp catalogue wrote its snapshot into whichever data directory the environment
-        // pointed at. In this project that meant `cargo test` evicting the user's genuine
-        // pre-migration snapshots -- the documented rollback path for a schema migration.
+        // #44: this route used to resolve Config::default_paths() for its snapshot destination, so
+        // a request that mutated a temp catalogue wrote its snapshot into whichever data directory
+        // the environment pointed at. In this project that meant `cargo test` evicting the user's
+        // genuine pre-migration snapshots -- the documented rollback path for a schema migration.
+        // The queue's drain (src/quarantine_queue.rs) now calls `catalog::backup::snapshot_beside`,
+        // which derives the backups directory from the catalogue path itself; this test exercises
+        // that call.
         //
         // The ambient directory here stands in for the user's real one: it must stay empty.
         let ambient = ScopedDataDir::new();
@@ -4095,6 +4210,7 @@ mod tests {
                 )
                 .unwrap()
         };
+        tokio::spawn(state.quarantine_queue.clone().run_worker());
         let app = build_router_with(state);
         let res = app
             .oneshot(
@@ -4112,8 +4228,35 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), axum::http::StatusCode::OK);
 
+        // `catalog::backup::snapshot` opens its destination with the default DELETE journal mode,
+        // so while the backup copy is running the directory transiently holds both
+        // `catalog-{now}.db` and `catalog-{now}.db-journal` -- the journal disappears once the
+        // backup connection drops. Counting only the `.db` file itself (excluding `-journal`/
+        // `-wal`/`-shm` companions) is what removes that race: a reader that lands mid-backup
+        // still can't see a `.db` file until the rename that publishes it completes, so a single
+        // poll landing on count == 1 is already the final state, not a snapshot of an in-progress
+        // write. (An earlier version of this test also required the count to "settle" across two
+        // consecutive polls; with only one snapshot ever taken and the `.db` filter already
+        // excluding the transient journal, that check could never distinguish anything and has
+        // been dropped.)
         let own = db.parent().unwrap().join("catalog.backups");
-        let n_own = std::fs::read_dir(&own).map(|d| d.count()).unwrap_or(0);
+        let count_snapshots = |dir: &std::path::Path| -> usize {
+            std::fs::read_dir(dir)
+                .map(|d| {
+                    d.filter_map(|e| e.ok())
+                        .filter(|e| e.file_name().to_string_lossy().ends_with(".db"))
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        let mut n_own = 0;
+        for _ in 0..400 {
+            n_own = count_snapshots(&own);
+            if n_own == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
         assert_eq!(
             n_own, 1,
             "the snapshot belongs beside the catalogue being mutated"

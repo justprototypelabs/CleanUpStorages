@@ -1006,15 +1006,22 @@ $("#confirm").addEventListener("click",async()=>{
   const g=groups[idx]; if(!g)return;
   const victims=g.members.filter(m=>m.id!==keepId&&m.is_loose).map(m=>m.id);
   if(victims.length===0){ $("#msg").textContent="Nothing to quarantine (the other copies are inside archives)."; return; }
+  // The request only ENQUEUES, so the reviewer moves to the next group straight away instead of
+  // waiting out a re-hash. Failures surface through the status poll, not from this call.
+  // Disabled for the duration of the request: a second click before the first POST returns would
+  // still run idx++ itself, advancing past a group the reviewer never saw (the server-side
+  // de-dup only stops the file being queued twice, not the double advance).
   $("#confirm").disabled=true;
-  // Verification re-reads both files, so a multi-GB group takes real time. Say so, or the wait
-  // reads as a hang.
-  $("#msg").textContent="Verifying content, then quarantining… (large files take a while)";
   try{
     const j=await apiPost("/api/quarantine",{quarantine_ids:victims});
-    let m=`Quarantined ${j.quarantined}, skipped ${j.skipped}.`; if(j.unmounted_volumes&&j.unmounted_volumes.length) m+=" Some drives not connected."; if(j.errors&&j.errors.length) m+=" Errors: "+j.errors.join("; "); $("#msg").textContent=m; idx++; render();
-  }catch(e){ $("#msg").textContent="Error: "+e; }
-  $("#confirm").disabled=false;
+    let m="Queued "+j.queued+" file"+(j.queued===1?"":"s")+".";
+    if(j.skipped) m+=" "+j.skipped+" skipped.";
+    if(j.unmounted_volumes&&j.unmounted_volumes.length) m+=" Some drives not connected.";
+    $("#msg").textContent=m;
+    idx++; render();
+    pollQuarantine();
+  }catch(e){ $("#msg").textContent="Could not queue: "+e; }
+  finally{ $("#confirm").disabled=false; }
 });
 $("#skip").addEventListener("click",()=>{ idx++; $("#msg").textContent=""; render(); });
 // A plain <select>: enhanceSelect is the Browse page's multi-select widget and the floor is one value.
@@ -1143,7 +1150,7 @@ async function confirmTree(group,member,btn){
   }
 }
 
-let qTimer=null, qWasBusy=false;
+let qTimer=null, qWasBusy=false, qMaxSeqReported=-1;
 async function pollQuarantine(){
   if(qTimer) return;                       // one poller is enough
   const tick=async()=>{
@@ -1151,21 +1158,36 @@ async function pollQuarantine(){
     const busy=!!st.running || st.pending.length>0;
     const bar=$("#qstatus");
     if(busy){
-      const now=st.running?st.running.path:"";
+      const now=st.running?st.running.label:"";
       bar.textContent="Quarantining "+now+(st.pending.length?" — "+st.pending.length+" queued":"");
       bar.style.display="";
     }else{ bar.style.display="none"; }
+    // `recent` is capped server-side at 50 and reordered newest-first, so filtering it whole would
+    // let one stale failure from forty confirms ago pin the message forever. `seq` is monotonic and
+    // assigned once, in order, so "newer than the highest seq already reported" is exactly the set
+    // of results this poll has not shown the reviewer yet.
+    const fresh=st.recent.filter(r=>r.seq>qMaxSeqReported);
+    if(fresh.length) qMaxSeqReported=Math.max(...fresh.map(r=>r.seq));
     // Worker failures have to reach the user: they clicked, and it did not happen. A tree that is
     // no longer wholly active, or a drive swapped mid-queue, is refused rather than forced.
-    const failed=st.recent.filter(r=>r.error_message);
-    if(failed.length){
-      $("#msg").textContent=failed.length+" could not be quarantined — "+failed[0].error_message;
-    }else if(st.recent.length){
-      const done=st.recent.filter(r=>!r.error_message).length;
-      $("#msg").textContent=done+" folder"+(done===1?"":"s")+" moved to _ToDelete.";
-    }
-    // Refresh only once the queue drains: the worker rebuilds the folder index at that point, so
-    // reloading earlier would show a list that is about to change again.
+    const failed=fresh.filter(r=>r.error_message);
+    const folders=fresh.filter(r=>!r.error_message&&r.kind==="tree").length;
+    const files=fresh.filter(r=>!r.error_message&&r.kind==="files")
+                     .reduce((a,r)=>a+r.files_updated,0);
+    // `skipped` on a files job covers several distinct reasons a copy was not moved (a guard
+    // that protects the last copy, a stale id, a file no longer loose/active, a read error
+    // re-hashing it) -- so the wording below must not claim any one cause the field cannot back
+    // up. Rendered unconditionally: a skip is a fact independent of whether any job also failed,
+    // and hiding it behind the error branch let the reviewer believe a copy was handled when it
+    // had actually been left in place.
+    const skipped=fresh.reduce((a,r)=>a+(r.skipped||0),0);
+    const parts=[];
+    if(folders) parts.push(folders+" folder"+(folders===1?"":"s"));
+    if(files) parts.push(files+" file"+(files===1?"":"s"));
+    let m=parts.length?parts.join(" and ")+" moved to _ToDelete.":"";
+    if(skipped) m+=" "+skipped+" kept (not moved — see the action log).";
+    if(failed.length) m+=" "+failed.length+" could not be quarantined — "+failed[0].error_message;
+    if(m) $("#msg").textContent=m.trim();
     if(qWasBusy && !busy){ clearInterval(qTimer); qTimer=null; await loadTrees(); }
     qWasBusy=busy;
   };
@@ -1678,7 +1700,8 @@ async function exec(line){
       printJSON(await apiPost("/api/scan",{path,force})); return; }
     if(cmd==="quarantine"){ const ids=toks.map(Number).filter(n=>!isNaN(n));
       if(!ids.length){ print("usage: quarantine <id> [id ...]","mut"); return; }
-      printJSON(await apiPost("/api/quarantine",{quarantine_ids:ids})); return; }
+      const r=await apiPost("/api/quarantine",{quarantine_ids:ids});
+      printJSON(r); print("Queued — the worker runs these in order; watch /api/quarantine/status."); return; }
     if(cmd==="repack"){ const id=Number(toks[0]); if(isNaN(id)){ print("usage: repack <id>","mut"); return; }
       printJSON(await apiPost("/api/repack",{entry_id:id})); return; }
     if(cmd==="forget"){ if(!toks[0]){ print("usage: forget <volumeId>","mut"); return; }
