@@ -14,14 +14,17 @@ fn start(state_db: std::path::PathBuf, drive: std::path::PathBuf) -> std::net::S
             mounts.insert("vol-1".to_string(), drive);
             let state = cleanupstorages::web::AppState {
                 catalog_path: state_db.clone(),
-                mounts: cleanupstorages::mounts::MountResolver::Fixed(mounts),
+                mounts: cleanupstorages::mounts::MountResolver::Fixed(mounts.clone()),
                 csrf_token: "TESTTOKEN".to_string(),
                 scan_queue: cleanupstorages::scan_queue::ScanQueue::new(state_db.clone()),
+                // Same resolver the rest of the state uses -- an empty one would make every
+                // queued job fail with "drive not connected" while the request path looked fine.
                 quarantine_queue: cleanupstorages::quarantine_queue::QuarantineQueue::new(
                     state_db,
-                    cleanupstorages::mounts::MountResolver::Fixed(Default::default()),
+                    cleanupstorages::mounts::MountResolver::Fixed(mounts),
                 ),
             };
+            tokio::spawn(state.quarantine_queue.clone().run_worker());
             let app = cleanupstorages::web::build_router_with(state);
             let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
                 .await
@@ -110,9 +113,17 @@ fn review_duplicates_then_quarantine_over_http() {
     let post = format!("POST /api/quarantine HTTP/1.0\r\nHost: x\r\ncontent-type: application/json\r\nx-cleanup-token: TESTTOKEN\r\ncontent-length: {}\r\n\r\n{}", payload.len(), payload);
     let resp = req(addr, &post);
     assert!(resp.contains("200 OK"), "quarantine resp: {resp}");
-    assert!(resp.contains("\"quarantined\":1"), "resp: {resp}");
+    assert!(resp.contains("\"queued\":1"), "resp: {resp}");
 
-    // 3) exactly one copy remains on disk, the other is in _ToDelete
+    // 3) the request only enqueued the job; poll for the worker to actually move the file.
+    for _ in 0..400 {
+        if drive.join("_ToDelete").exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    // exactly one copy remains on disk, the other is in _ToDelete
     let remaining = [
         drive.join("a.jpg").exists(),
         drive.join("copy/a.jpg").exists(),
