@@ -1,8 +1,13 @@
-//! Serial background queue for folder quarantines, so reviewing does not mean waiting (#66).
+//! Serial background queue for folder AND single-file quarantines, so reviewing does not mean
+//! waiting (#66).
 //!
 //! **Serial is required, not a simplification.** SQLite has a single writer, and every item
-//! re-checks that its files are still `active` immediately before moving them — a check that only
-//! means anything if nothing else is mutating the catalogue at the same time.
+//! re-checks that its files are still `active` immediately before moving them. This queue is
+//! serial only within itself, though: `scan_queue::run_worker` is a separate task that also
+//! writes to the catalogue. The check above is safe regardless, because it lives inside the
+//! quarantine engines (`src/quarantine.rs`, `src/tree_quarantine.rs`) and re-reads the row
+//! immediately before acting — the engine's own pre-move check is the actual safety, not the
+//! absence of other writers.
 //!
 //! What the queue changes is *who* waits. The reviewer confirms an item and moves on; the worker
 //! drains the list in order. The expensive part — rebuilding the directory tree over every row —
@@ -16,6 +21,11 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Serialize)]
 pub struct QuarantineResult {
+    /// Monotonically increasing, assigned when the result is pushed. `recent` is capped at
+    /// `RECENT_CAP` and reordered to newest-first, so nothing else about a result says whether the
+    /// UI has already reported it; `seq` is what lets the poller derive "results I have not shown
+    /// yet" instead of re-deriving a message from the whole (truncated) buffer every tick.
+    pub seq: u64,
     /// `"tree"` or `"files"`, so the UI can word its message without guessing from the label.
     pub kind: String,
     pub volume_id: String,
@@ -24,8 +34,12 @@ pub struct QuarantineResult {
     pub label: String,
     /// Files whose catalogue rows were updated, or 0 when the item failed.
     pub files_updated: usize,
-    /// Files the last-copy guard protected. A skip is not an error: it is the guard doing its job,
-    /// and the reviewer still needs to see the number.
+    /// Files `quarantine_files` moved nobody for: could be the last-copy guard, a stale id, a file
+    /// that is no longer a loose active entry, or an I/O error re-reading it. `quarantine_files`
+    /// does not tell the queue which reason applied for a given id (see `src/quarantine.rs`), so
+    /// this is deliberately a count, not a claim about cause — the reason string is still written
+    /// to the action log. A skip is not necessarily an error: the reviewer still needs to see the
+    /// number either way.
     pub skipped: usize,
     pub dest: Option<String>,
     /// Present exactly when the item failed. A refusal — drive swapped, tree no longer all active —
@@ -36,8 +50,11 @@ pub struct QuarantineResult {
 
 #[derive(Clone, Serialize)]
 pub struct QuarantineJobDto {
+    /// `"tree"` or `"files"` — mirrors `QuarantineResult::kind`.
     pub kind: String,
     pub volume_id: String,
+    /// What the status bar shows while this job runs or waits: a folder path for a tree job, or a
+    /// count like `"3 files"` for a files job (see `Job::label`).
     pub label: String,
 }
 
@@ -98,6 +115,9 @@ struct Inner {
     /// them: a review session that quarantines on both drives would otherwise leave the first
     /// drive's directory index describing folders that have already moved.
     touched: std::collections::HashSet<String>,
+    /// Next `seq` to assign. Only ever incremented, so a UI polling `status()` can tell "have I
+    /// reported this one already" from the number alone, independent of `recent`'s 50-item cap.
+    next_seq: u64,
 }
 
 impl Inner {
@@ -143,6 +163,7 @@ impl QuarantineQueue {
                 running: None,
                 recent: VecDeque::new(),
                 touched: std::collections::HashSet::new(),
+                next_seq: 0,
             }),
             notify: tokio::sync::Notify::new(),
         })
@@ -285,8 +306,11 @@ impl QuarantineQueue {
         })
         .await;
 
-        let result = match joined {
+        // `seq` is assigned below, under the lock, so it is truly monotonic across concurrent
+        // completions; 0 here is just a placeholder for the field.
+        let mut result = match joined {
             Ok(Ok(d)) => QuarantineResult {
+                seq: 0,
                 kind,
                 volume_id: volume_id.clone(),
                 label,
@@ -296,6 +320,7 @@ impl QuarantineQueue {
                 error_message: None,
             },
             Ok(Err(e)) => QuarantineResult {
+                seq: 0,
                 kind,
                 volume_id: volume_id.clone(),
                 label,
@@ -305,6 +330,7 @@ impl QuarantineQueue {
                 error_message: Some(e.to_string()),
             },
             Err(e) => QuarantineResult {
+                seq: 0,
                 kind,
                 volume_id: volume_id.clone(),
                 label,
@@ -319,6 +345,8 @@ impl QuarantineQueue {
             let mut inner = self.inner.lock().unwrap();
             inner.running = None;
             inner.touched.insert(volume_id.clone());
+            result.seq = inner.next_seq;
+            inner.next_seq += 1;
             inner.recent.push_front(result);
             while inner.recent.len() > RECENT_CAP {
                 inner.recent.pop_back();
@@ -338,7 +366,7 @@ impl QuarantineQueue {
         // look again.
         if drained {
             let catalog_path = self.catalog_path.clone();
-            let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 let cat = crate::catalog::Catalog::open(&catalog_path)?;
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)?
@@ -354,6 +382,20 @@ impl QuarantineQueue {
                 Ok(())
             })
             .await;
+            // The quarantine itself already happened and is already recorded, so this is
+            // deliberately best-effort -- but a silently discarded error here means the review
+            // list can go stale (rebuild) or a rollback point can go missing (snapshot) with
+            // nothing in the logs to explain either. See #79 for the wider question of whether
+            // this loop should retry instead of just moving on; out of scope here.
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!("post-drain rebuild/snapshot failed: {e:#}");
+                }
+                Err(e) => {
+                    tracing::warn!("post-drain rebuild/snapshot task did not complete: {e}");
+                }
+            }
         }
     }
 }
@@ -559,6 +601,62 @@ mod tests {
         assert_eq!(r.files_updated, 1, "one copy moved");
         assert_eq!(r.skipped, 1, "the last copy was protected");
         assert!(r.error_message.is_none(), "a guarded skip is not a failure");
+    }
+
+    #[tokio::test]
+    async fn seq_is_monotonic_across_results_so_the_ui_can_tell_what_it_has_not_reported_yet() {
+        // F2: the UI polls `recent`, which the server caps at RECENT_CAP -- a stale failure or
+        // skip from long ago must not stay visible forever just because it's still in the buffer,
+        // and a real one must not be missed just because the buffer briefly overflowed. `seq` is
+        // what lets the poller ask "results newer than the highest I've already shown" instead of
+        // re-deriving a message from the whole truncated buffer every tick.
+        let (_t, drive, q) = fake_drive();
+        std::fs::write(drive.join("b.txt"), b"OTHER").unwrap();
+        std::fs::write(drive.join("copy/b.txt"), b"OTHER").unwrap();
+        {
+            let cat = crate::catalog::Catalog::open(q.catalog_path_for_test()).unwrap();
+            let mk = |path: &str| crate::catalog::models::NewFile {
+                volume_id: "vol-1".into(),
+                relative_path: path.into(),
+                filename: path.rsplit('/').next().unwrap().into(),
+                extension: "txt".into(),
+                size_bytes: 5,
+                content_hash: "OTHERHASH".into(),
+                created_time: None,
+                modified_time: None,
+                accessed_time: None,
+                category: crate::category::Category::Document,
+                container_chain: None,
+            };
+            cat.upsert_file(&mk("b.txt"), 100).unwrap();
+            cat.upsert_file(&mk("copy/b.txt"), 100).unwrap();
+        }
+        tokio::spawn(q.clone().run_worker());
+
+        let first = loose_id(&q, "copy/a.txt");
+        q.enqueue_files("vol-1".into(), vec![first]);
+        drain(&q).await;
+        let seq_first = q.status().recent[0].seq;
+
+        let second = loose_id(&q, "copy/b.txt");
+        q.enqueue_files("vol-1".into(), vec![second]);
+        for _ in 0..400 {
+            let s = q.status();
+            if s.running.is_none() && s.pending.is_empty() && s.recent.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let recent = q.status().recent;
+        assert_eq!(recent.len(), 2, "both jobs are recorded");
+        assert!(
+            recent[0].seq > seq_first,
+            "the newer result must carry a strictly higher seq than the earlier one \
+             (newest-first: recent[0]={}, first result was {})",
+            recent[0].seq,
+            seq_first
+        );
+        assert_eq!(recent[1].seq, seq_first, "seq is assigned once, in order");
     }
 
     #[tokio::test]

@@ -126,8 +126,12 @@ because the alternative is believing a duplicate was handled when it was not.
 Extending [`quarantine_queue.rs`'s existing test module](../../../src/quarantine_queue.rs#L219):
 
 1. A `Files` job moves the requested ids and leaves the keep-copy alone.
-2. A `Files` job whose ids are no longer `active` is refused, with `error_message` set — not
-   silently skipped.
+2. A `Files` job whose ids are no longer `active` succeeds with those ids counted in `skipped`,
+   `error_message` unset — the same path the last-copy guard uses (row above). A stale id is a
+   decision the reviewer already made that has since been overtaken by events, not a failure of
+   the job itself, so it is a skip like any other: `error_message` is reserved for the job as a
+   whole not taking effect (drive gone, panic), not for individual ids inside it that turned out
+   to be no-ops.
 3. Enqueuing the same id set twice queues one job.
 4. `Tree` and `Files` jobs interleave in submission order; the worker never runs two at once.
 5. **A queue spanning two volumes rebuilds the directory index for both** — the regression this

@@ -25,7 +25,8 @@ pub struct AppState {
     pub mounts: crate::mounts::MountResolver,
     pub csrf_token: String,
     pub scan_queue: std::sync::Arc<crate::scan_queue::ScanQueue>,
-    /// Serial worker for folder quarantines, so confirming one does not block the next (#66).
+    /// Serial worker for folder and single-file quarantines, so confirming one does not block
+    /// the next (#66).
     pub quarantine_queue: std::sync::Arc<crate::quarantine_queue::QuarantineQueue>,
 }
 
@@ -3161,6 +3162,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confirm_button_is_disabled_for_the_duration_of_the_request() {
+        // F1: a double-click on Confirm used to run `idx++; render();` twice -- the server-side
+        // de-dup stops the file being queued twice, but nothing stopped the reviewer being
+        // advanced past a group they never saw. Disabling the button around the await (and
+        // re-enabling in a `finally`, so a thrown request cannot leave it dead forever) is what
+        // makes the second click a no-op instead of a second advance.
+        let (_t, _db, state) = seed_dupes();
+        let body = get_text(state, "/review").await;
+        let handler_start = body
+            .find("$(\"#confirm\").addEventListener")
+            .expect("confirm click handler must exist");
+        let handler_end = body[handler_start..]
+            .find("$(\"#skip\").addEventListener")
+            .map(|i| handler_start + i)
+            .expect("skip handler follows confirm handler");
+        let handler = &body[handler_start..handler_end];
+        assert!(
+            handler.contains("$(\"#confirm\").disabled=true"),
+            "the button must be disabled before the request is sent"
+        );
+        assert!(
+            handler.contains("finally"),
+            "re-enabling must happen in a finally so a thrown request can't leave it dead"
+        );
+        assert!(
+            handler.contains("$(\"#confirm\").disabled=false"),
+            "the button must be re-enabled once the request settles"
+        );
+    }
+
+    #[tokio::test]
+    async fn skipped_wording_does_not_claim_a_cause_it_cannot_back_up() {
+        // F3: `quarantine_files` increments `skipped` for five different reasons -- only one of
+        // them is the last-copy guard. Wording it as "kept by the last-copy guard" reports an I/O
+        // error on the user's drive as the safety guard working correctly, which is the wrong
+        // direction to be wrong in.
+        let (_t, _db, state) = seed_dupes();
+        let body = get_text(state, "/review").await;
+        assert!(
+            !body.contains("last-copy guard"),
+            "must not claim the last-copy guard specifically -- skipped has four other causes"
+        );
+        assert!(
+            body.contains("kept (not moved"),
+            "must use wording that does not assert a cause"
+        );
+    }
+
+    #[tokio::test]
     async fn index_page_has_search_ui_and_calls_api() {
         use axum::body::Body;
         use axum::http::Request;
@@ -4181,9 +4231,14 @@ mod tests {
         // `catalog::backup::snapshot` opens its destination with the default DELETE journal mode,
         // so while the backup copy is running the directory transiently holds both
         // `catalog-{now}.db` and `catalog-{now}.db-journal` -- the journal disappears once the
-        // backup connection drops. Count only the `.db` file itself (excluding `-journal`/`-wal`/
-        // `-shm` companions) and require the count to settle at one on two consecutive polls, so a
-        // reader that lands mid-backup can't mistake that transient pair for the final state.
+        // backup connection drops. Counting only the `.db` file itself (excluding `-journal`/
+        // `-wal`/`-shm` companions) is what removes that race: a reader that lands mid-backup
+        // still can't see a `.db` file until the rename that publishes it completes, so a single
+        // poll landing on count == 1 is already the final state, not a snapshot of an in-progress
+        // write. (An earlier version of this test also required the count to "settle" across two
+        // consecutive polls; with only one snapshot ever taken and the `.db` filter already
+        // excluding the transient journal, that check could never distinguish anything and has
+        // been dropped.)
         let own = db.parent().unwrap().join("catalog.backups");
         let count_snapshots = |dir: &std::path::Path| -> usize {
             std::fs::read_dir(dir)
@@ -4195,16 +4250,10 @@ mod tests {
                 .unwrap_or(0)
         };
         let mut n_own = 0;
-        let mut settled = 0;
         for _ in 0..400 {
             n_own = count_snapshots(&own);
             if n_own == 1 {
-                settled += 1;
-                if settled >= 2 {
-                    break;
-                }
-            } else {
-                settled = 0;
+                break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
