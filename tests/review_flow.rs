@@ -116,21 +116,30 @@ fn review_duplicates_then_quarantine_over_http() {
     assert!(resp.contains("\"queued\":1"), "resp: {resp}");
 
     // 3) the request only enqueued the job; poll for the worker to actually move the file.
+    // quarantine::quarantine_files() creates the `_ToDelete` directory microseconds before the
+    // rename lands the file inside it, so polling on the directory's existence can break in that
+    // gap and race the assertions below. Poll on the effect the test actually asserts instead --
+    // that exactly one of the two original copies is still on disk -- which can only make the
+    // wait longer, never let it pass early.
+    let remaining_now = || {
+        [
+            drive.join("a.jpg").exists(),
+            drive.join("copy/a.jpg").exists(),
+        ]
+        .iter()
+        .filter(|x| **x)
+        .count()
+    };
+    let mut remaining = remaining_now();
     for _ in 0..400 {
-        if drive.join("_ToDelete").exists() {
+        remaining = remaining_now();
+        if remaining == 1 {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
 
     // exactly one copy remains on disk, the other is in _ToDelete
-    let remaining = [
-        drive.join("a.jpg").exists(),
-        drive.join("copy/a.jpg").exists(),
-    ]
-    .iter()
-    .filter(|x| **x)
-    .count();
     assert_eq!(remaining, 1);
     assert!(drive.join("_ToDelete").exists());
 }

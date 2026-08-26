@@ -940,7 +940,7 @@ async fn api_quarantine(
 ) -> Result<Json<QuarantineQueuedFilesDto>, (StatusCode, String)> {
     check_csrf(&headers, &state)?;
 
-    let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
+    let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
 
     // Group requested ids by their volume; ids that don't resolve to a file are counted skipped.
     let mut by_volume: std::collections::HashMap<String, Vec<i64>> =
@@ -4138,10 +4138,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_mutation_snapshots_beside_its_own_catalogue_not_the_ambient_one() {
-        // #44: snapshot_best_effort used to resolve Config::default_paths(), so a request that
-        // mutated a temp catalogue wrote its snapshot into whichever data directory the environment
-        // pointed at. In this project that meant `cargo test` evicting the user's genuine
-        // pre-migration snapshots -- the documented rollback path for a schema migration.
+        // #44: this route used to resolve Config::default_paths() for its snapshot destination, so
+        // a request that mutated a temp catalogue wrote its snapshot into whichever data directory
+        // the environment pointed at. In this project that meant `cargo test` evicting the user's
+        // genuine pre-migration snapshots -- the documented rollback path for a schema migration.
+        // The queue's drain (src/quarantine_queue.rs) now calls `catalog::backup::snapshot_beside`,
+        // which derives the backups directory from the catalogue path itself; this test exercises
+        // that call.
         //
         // The ambient directory here stands in for the user's real one: it must stay empty.
         let ambient = ScopedDataDir::new();
@@ -4175,12 +4178,33 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), axum::http::StatusCode::OK);
 
+        // `catalog::backup::snapshot` opens its destination with the default DELETE journal mode,
+        // so while the backup copy is running the directory transiently holds both
+        // `catalog-{now}.db` and `catalog-{now}.db-journal` -- the journal disappears once the
+        // backup connection drops. Count only the `.db` file itself (excluding `-journal`/`-wal`/
+        // `-shm` companions) and require the count to settle at one on two consecutive polls, so a
+        // reader that lands mid-backup can't mistake that transient pair for the final state.
         let own = db.parent().unwrap().join("catalog.backups");
+        let count_snapshots = |dir: &std::path::Path| -> usize {
+            std::fs::read_dir(dir)
+                .map(|d| {
+                    d.filter_map(|e| e.ok())
+                        .filter(|e| e.file_name().to_string_lossy().ends_with(".db"))
+                        .count()
+                })
+                .unwrap_or(0)
+        };
         let mut n_own = 0;
+        let mut settled = 0;
         for _ in 0..400 {
-            n_own = std::fs::read_dir(&own).map(|d| d.count()).unwrap_or(0);
-            if n_own > 0 {
-                break;
+            n_own = count_snapshots(&own);
+            if n_own == 1 {
+                settled += 1;
+                if settled >= 2 {
+                    break;
+                }
+            } else {
+                settled = 0;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
