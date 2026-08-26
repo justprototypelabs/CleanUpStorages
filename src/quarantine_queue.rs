@@ -103,6 +103,20 @@ impl Inner {
     }
 }
 
+/// What the blocking half of a job actually has to do, lifted out of `Job` so the mutex is not held
+/// across the `await`.
+enum Work {
+    Tree(String),
+    Files(Vec<i64>),
+}
+
+/// The shape both engines collapse to once they succeed.
+struct Done {
+    files_updated: usize,
+    skipped: usize,
+    dest: Option<String>,
+}
+
 pub struct QuarantineQueue {
     catalog_path: PathBuf,
     mounts: crate::mounts::MountResolver,
@@ -197,6 +211,12 @@ impl QuarantineQueue {
         }
     }
 
+    /// Test-only: the catalogue this queue writes to. Tests need to read back what the worker did.
+    #[cfg(test)]
+    pub(crate) fn catalog_path_for_test(&self) -> &std::path::Path {
+        &self.catalog_path
+    }
+
     /// Background loop: drain the queue one item at a time, forever.
     pub async fn run_worker(self: Arc<Self>) {
         loop {
@@ -211,61 +231,73 @@ impl QuarantineQueue {
         }
     }
 
-    // `run_job` is deliberately incomplete: it still only executes `Job::Tree`. `Job::Files` is
-    // wired up in the next task, which replaces this function entirely.
     async fn run_job(self: &Arc<Self>, job: Job) {
         let (volume_id, kind, label) = (
             job.volume_id().to_string(),
             job.kind().to_string(),
             job.label(),
         );
+        let work = match &job {
+            Job::Tree { path, .. } => Work::Tree(path.clone()),
+            Job::Files { ids, .. } => Work::Files(ids.clone()),
+        };
         {
             let mut inner = self.inner.lock().unwrap();
             inner.running = Some(job);
         }
 
-        let running_path: Option<String> = {
-            let inner = self.inner.lock().unwrap();
-            match inner.running.as_ref().unwrap() {
-                Job::Tree { path, .. } => Some(path.clone()),
-                Job::Files { .. } => None,
-            }
-        };
-        let outcome: anyhow::Result<(usize, usize, Option<String>)> = match running_path {
-            Some(path) => {
-                let mount = self.mounts.resolve(&volume_id);
-                let catalog_path = self.catalog_path.clone();
-                let vid = volume_id.clone();
-                // Off the async runtime: the rename is instant but the per-file bookkeeping is not,
-                // and the largest single group here is 326,569 files.
-                tokio::task::spawn_blocking(
-                    move || -> anyhow::Result<(usize, usize, Option<String>)> {
-                        let mount = mount.ok_or_else(|| anyhow::anyhow!("drive not connected"))?;
-                        let cat = crate::catalog::Catalog::open(&catalog_path)?;
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)?
-                            .as_secs() as i64;
-                        let out = crate::tree_quarantine::quarantine_tree(
-                            &cat, &mount, &vid, &path, now,
-                        )?;
-                        Ok((out.files_updated, 0, Some(out.dest_relative_path)))
-                    },
-                )
-                .await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("quarantine task failed: {e}")))
-            }
-            None => Err(anyhow::anyhow!("files jobs land in Task 2")),
-        };
+        let mount = self.mounts.resolve(&volume_id);
+        let catalog_path = self.catalog_path.clone();
+        let vid = volume_id.clone();
 
-        let result = match outcome {
-            Ok((files_updated, skipped, dest)) => QuarantineResult {
+        // Off the async runtime: quarantine re-hashes before it moves anything, so a multi-GB group
+        // takes real time, and the largest single tree here is 326,569 files.
+        let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<Done> {
+            let mount = mount.ok_or_else(|| anyhow::anyhow!("drive not connected"))?;
+            let cat = crate::catalog::Catalog::open(&catalog_path)?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs() as i64;
+            Ok(match work {
+                Work::Tree(path) => {
+                    let out =
+                        crate::tree_quarantine::quarantine_tree(&cat, &mount, &vid, &path, now)?;
+                    Done {
+                        files_updated: out.files_updated,
+                        skipped: 0,
+                        dest: Some(out.dest_relative_path),
+                    }
+                }
+                Work::Files(ids) => {
+                    let out = crate::quarantine::quarantine_files(&cat, &mount, &vid, &ids, now)?;
+                    Done {
+                        files_updated: out.quarantined,
+                        skipped: out.skipped,
+                        dest: None,
+                    }
+                }
+            })
+        })
+        .await;
+
+        let result = match joined {
+            Ok(Ok(d)) => QuarantineResult {
                 kind,
                 volume_id: volume_id.clone(),
                 label,
-                files_updated,
-                skipped,
-                dest,
+                files_updated: d.files_updated,
+                skipped: d.skipped,
+                dest: d.dest,
                 error_message: None,
+            },
+            Ok(Err(e)) => QuarantineResult {
+                kind,
+                volume_id: volume_id.clone(),
+                label,
+                files_updated: 0,
+                skipped: 0,
+                dest: None,
+                error_message: Some(e.to_string()),
             },
             Err(e) => QuarantineResult {
                 kind,
@@ -274,7 +306,7 @@ impl QuarantineQueue {
                 files_updated: 0,
                 skipped: 0,
                 dest: None,
-                error_message: Some(e.to_string()),
+                error_message: Some(format!("quarantine task failed: {e}")),
             },
         };
 
@@ -291,7 +323,7 @@ impl QuarantineQueue {
         // Rebuild ONCE, when there is nothing left to do. Rebuilding per item meant reprocessing
         // every row in the catalogue for each folder moved; the review list is stale in exactly the
         // same way after one item or twenty, so the work only needs doing when the user is about to
-        // look again.
+        // look again. Task 3 widens this to every volume the queue touched.
         if drained {
             let catalog_path = self.catalog_path.clone();
             let vid = volume_id.clone();
@@ -414,5 +446,127 @@ mod tests {
         q.enqueue_files("uni-big".into(), vec![1]);
         q.enqueue_files("uni-small".into(), vec![1]);
         assert_eq!(q.status().pending.len(), 2);
+    }
+
+    /// A fake mounted drive carrying its marker, two identical files, and a catalogue that knows
+    /// about both. `copy/a.txt` is the redundant one; `a.txt` is the survivor.
+    fn fake_drive() -> (tempfile::TempDir, PathBuf, Arc<QuarantineQueue>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("c.db");
+        let drive = tmp.path().join("driveA");
+        std::fs::create_dir_all(drive.join("copy")).unwrap();
+        std::fs::write(drive.join(".cleanupstorages_id"), "vol-1").unwrap();
+        std::fs::write(drive.join("a.txt"), b"SAME").unwrap();
+        std::fs::write(drive.join("copy/a.txt"), b"SAME").unwrap();
+        {
+            let cat = crate::catalog::Catalog::open(&db).unwrap();
+            cat.upsert_volume(&crate::catalog::models::Volume {
+                volume_id: "vol-1".into(),
+                label: "D".into(),
+                identified_by: "marker".into(),
+                first_seen_at: 1,
+                last_seen_at: 1,
+            })
+            .unwrap();
+            let mk = |path: &str| crate::catalog::models::NewFile {
+                volume_id: "vol-1".into(),
+                relative_path: path.into(),
+                filename: path.rsplit('/').next().unwrap().into(),
+                extension: "txt".into(),
+                size_bytes: 4,
+                content_hash: "SAMEHASH".into(),
+                created_time: None,
+                modified_time: None,
+                accessed_time: None,
+                category: crate::category::Category::Document,
+                container_chain: None,
+            };
+            cat.upsert_file(&mk("a.txt"), 100).unwrap();
+            cat.upsert_file(&mk("copy/a.txt"), 100).unwrap();
+            cat.rebuild_directory_trees("vol-1", 100).unwrap();
+        }
+        let mut mounts = std::collections::HashMap::new();
+        mounts.insert("vol-1".to_string(), drive.clone());
+        let q = QuarantineQueue::new(db, crate::mounts::MountResolver::Fixed(mounts));
+        (tmp, drive, q)
+    }
+
+    /// Wait for the queue to go idle, rather than assuming an instant.
+    async fn drain(q: &Arc<QuarantineQueue>) {
+        for _ in 0..400 {
+            let s = q.status();
+            if s.running.is_none() && s.pending.is_empty() && !s.recent.is_empty() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("queue never drained");
+    }
+
+    fn loose_id(q: &Arc<QuarantineQueue>, path: &str) -> i64 {
+        let cat = crate::catalog::Catalog::open_readonly(q.catalog_path_for_test()).unwrap();
+        cat.loose_file_id("vol-1", path).unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_files_job_moves_the_chosen_copy_and_leaves_the_survivor() {
+        let (_t, drive, q) = fake_drive();
+        let victim = loose_id(&q, "copy/a.txt");
+        tokio::spawn(q.clone().run_worker());
+        q.enqueue_files("vol-1".into(), vec![victim]);
+        drain(&q).await;
+
+        assert!(drive.join("_ToDelete/copy/a.txt").is_file(), "moved");
+        assert!(!drive.join("copy/a.txt").exists(), "gone from its old home");
+        assert!(drive.join("a.txt").is_file(), "the survivor stays put");
+
+        let r = &q.status().recent[0];
+        assert_eq!(r.kind, "files");
+        assert_eq!(r.files_updated, 1);
+        assert_eq!(r.skipped, 0);
+        assert!(r.error_message.is_none(), "{:?}", r.error_message);
+    }
+
+    #[tokio::test]
+    async fn the_last_copy_guard_reports_a_skip_not_an_error() {
+        // Quarantining BOTH copies would leave nothing. The guard protects the second one, and the
+        // reviewer has to see that number — a silent skip reads as success.
+        let (_t, _drive, q) = fake_drive();
+        let a = loose_id(&q, "a.txt");
+        let b = loose_id(&q, "copy/a.txt");
+        tokio::spawn(q.clone().run_worker());
+        q.enqueue_files("vol-1".into(), vec![a, b]);
+        drain(&q).await;
+
+        let r = &q.status().recent[0];
+        assert_eq!(r.files_updated, 1, "one copy moved");
+        assert_eq!(r.skipped, 1, "the last copy was protected");
+        assert!(r.error_message.is_none(), "a guarded skip is not a failure");
+    }
+
+    #[tokio::test]
+    async fn a_files_job_for_an_unplugged_drive_fails_loudly() {
+        // The reviewer clicked. If it did not happen they must be told, because the alternative is
+        // believing a duplicate was handled when it was not.
+        let (_t, _drive, q) = fake_drive();
+        let victim = loose_id(&q, "copy/a.txt");
+        let q = QuarantineQueue::new(
+            q.catalog_path_for_test().to_path_buf(),
+            crate::mounts::MountResolver::Fixed(Default::default()),
+        );
+        tokio::spawn(q.clone().run_worker());
+        q.enqueue_files("vol-1".into(), vec![victim]);
+        drain(&q).await;
+
+        let r = &q.status().recent[0];
+        assert_eq!(r.files_updated, 0);
+        assert!(
+            r.error_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("not connected"),
+            "got {:?}",
+            r.error_message
+        );
     }
 }
