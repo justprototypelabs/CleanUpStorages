@@ -912,7 +912,8 @@ struct QuarantineReq {
 
 #[derive(Serialize, Default)]
 struct QuarantineQueuedFilesDto {
-    /// How many ids were actually handed to the worker.
+    /// How many of the requested ids are now queued for the worker (including any that a
+    /// previous click had already queued).
     queued: usize,
     /// Position of the last job enqueued; 0 means it starts next.
     position: usize,
@@ -3121,6 +3122,41 @@ mod tests {
         assert!(
             !body.contains("http://") && !body.contains("https://"),
             "self-contained"
+        );
+    }
+
+    async fn get_text(state: AppState, uri: &str) -> String {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let app = build_router_with(state);
+        let res = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), 10_000_000)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn review_page_confirms_without_promising_a_wait() {
+        // The old copy said "Verifying content, then quarantining… (large files take a while)" —
+        // true when the request blocked, a lie now that it queues.
+        let (_t, _db, state) = seed_dupes();
+        let body = get_text(state, "/review").await;
+        assert!(
+            !body.contains("Verifying content"),
+            "the blocking wording must be gone"
+        );
+        assert!(
+            body.contains("Queued"),
+            "the reviewer is told it was queued"
+        );
+        assert!(
+            body.contains("st.running.label"),
+            "the poller reads label, not the removed path field"
         );
     }
 

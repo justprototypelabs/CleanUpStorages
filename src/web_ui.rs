@@ -1006,15 +1006,17 @@ $("#confirm").addEventListener("click",async()=>{
   const g=groups[idx]; if(!g)return;
   const victims=g.members.filter(m=>m.id!==keepId&&m.is_loose).map(m=>m.id);
   if(victims.length===0){ $("#msg").textContent="Nothing to quarantine (the other copies are inside archives)."; return; }
-  $("#confirm").disabled=true;
-  // Verification re-reads both files, so a multi-GB group takes real time. Say so, or the wait
-  // reads as a hang.
-  $("#msg").textContent="Verifying content, then quarantining… (large files take a while)";
+  // The request only ENQUEUES, so the reviewer moves to the next group straight away instead of
+  // waiting out a re-hash. Failures surface through the status poll, not from this call.
   try{
     const j=await apiPost("/api/quarantine",{quarantine_ids:victims});
-    let m=`Quarantined ${j.quarantined}, skipped ${j.skipped}.`; if(j.unmounted_volumes&&j.unmounted_volumes.length) m+=" Some drives not connected."; if(j.errors&&j.errors.length) m+=" Errors: "+j.errors.join("; "); $("#msg").textContent=m; idx++; render();
-  }catch(e){ $("#msg").textContent="Error: "+e; }
-  $("#confirm").disabled=false;
+    let m="Queued "+j.queued+" file"+(j.queued===1?"":"s")+".";
+    if(j.skipped) m+=" "+j.skipped+" skipped.";
+    if(j.unmounted_volumes&&j.unmounted_volumes.length) m+=" Some drives not connected.";
+    $("#msg").textContent=m;
+    idx++; render();
+    pollQuarantine();
+  }catch(e){ $("#msg").textContent="Could not queue: "+e; }
 });
 $("#skip").addEventListener("click",()=>{ idx++; $("#msg").textContent=""; render(); });
 // A plain <select>: enhanceSelect is the Browse page's multi-select widget and the floor is one value.
@@ -1151,7 +1153,7 @@ async function pollQuarantine(){
     const busy=!!st.running || st.pending.length>0;
     const bar=$("#qstatus");
     if(busy){
-      const now=st.running?st.running.path:"";
+      const now=st.running?st.running.label:"";
       bar.textContent="Quarantining "+now+(st.pending.length?" — "+st.pending.length+" queued":"");
       bar.style.display="";
     }else{ bar.style.display="none"; }
@@ -1161,11 +1163,19 @@ async function pollQuarantine(){
     if(failed.length){
       $("#msg").textContent=failed.length+" could not be quarantined — "+failed[0].error_message;
     }else if(st.recent.length){
-      const done=st.recent.filter(r=>!r.error_message).length;
-      $("#msg").textContent=done+" folder"+(done===1?"":"s")+" moved to _ToDelete.";
+      const folders=st.recent.filter(r=>!r.error_message&&r.kind==="tree").length;
+      const files=st.recent.filter(r=>!r.error_message&&r.kind==="files")
+                           .reduce((a,r)=>a+r.files_updated,0);
+      // A guarded skip is not a failure, but hiding it would let the reviewer believe a copy was
+      // handled when the last-copy guard deliberately kept it.
+      const skipped=st.recent.reduce((a,r)=>a+(r.skipped||0),0);
+      const parts=[];
+      if(folders) parts.push(folders+" folder"+(folders===1?"":"s"));
+      if(files) parts.push(files+" file"+(files===1?"":"s"));
+      let m=parts.length?parts.join(" and ")+" moved to _ToDelete.":"";
+      if(skipped) m+=" "+skipped+" kept by the last-copy guard.";
+      if(m) $("#msg").textContent=m;
     }
-    // Refresh only once the queue drains: the worker rebuilds the folder index at that point, so
-    // reloading earlier would show a list that is about to change again.
     if(qWasBusy && !busy){ clearInterval(qTimer); qTimer=null; await loadTrees(); }
     qWasBusy=busy;
   };
@@ -1678,7 +1688,8 @@ async function exec(line){
       printJSON(await apiPost("/api/scan",{path,force})); return; }
     if(cmd==="quarantine"){ const ids=toks.map(Number).filter(n=>!isNaN(n));
       if(!ids.length){ print("usage: quarantine <id> [id ...]","mut"); return; }
-      printJSON(await apiPost("/api/quarantine",{quarantine_ids:ids})); return; }
+      const r=await apiPost("/api/quarantine",{quarantine_ids:ids});
+      printJSON(r); print("Queued — the worker runs these in order; watch /api/quarantine/status."); return; }
     if(cmd==="repack"){ const id=Number(toks[0]); if(isNaN(id)){ print("usage: repack <id>","mut"); return; }
       printJSON(await apiPost("/api/repack",{entry_id:id})); return; }
     if(cmd==="forget"){ if(!toks[0]){ print("usage: forget <volumeId>","mut"); return; }
