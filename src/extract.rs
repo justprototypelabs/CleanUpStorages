@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
+use anyhow::Context;
+
 use crate::catalog::Catalog;
 
 /// Windows' classic path limit. Rust can write past it through `\\?\`, but Explorer and most
@@ -271,11 +273,22 @@ pub fn verify_destination(
 ) -> anyhow::Result<()> {
     // chain -> hash, as it exists on disk right now.
     let mut found: HashMap<String, String> = HashMap::new();
-    for entry in walkdir::WalkDir::new(dest_abs)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-    {
+    for entry in walkdir::WalkDir::new(dest_abs).into_iter() {
+        // A dropped traversal error (a locked file, a permission-denied subdirectory, a disk
+        // hiccup -- all plausible on an external HDD mid-verification) must not be silently
+        // swallowed: `filter_map(Result::ok)` would turn a real I/O failure into a false
+        // "missing entry" report below, naming the wrong problem. Name the path and the failure
+        // instead, so the refusal says what actually happened.
+        let entry = entry.map_err(|e| {
+            let path = e
+                .path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| dest_abs.display().to_string());
+            anyhow::anyhow!("could not read {path}: {e}")
+        })?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
         let rel = entry
             .path()
             .strip_prefix(dest_abs)?
@@ -293,7 +306,8 @@ pub fn verify_destination(
             crate::archive::Descent::Descend
         );
         if descend {
-            let f = std::fs::File::open(entry.path())?;
+            let f = std::fs::File::open(entry.path())
+                .with_context(|| format!("could not read {rel}"))?;
             let scanned = crate::archive::scan_archive(std::io::BufReader::new(f), limits);
             for e in scanned.entries {
                 found.insert(
@@ -304,7 +318,9 @@ pub fn verify_destination(
         }
         // A descendable archive is ALSO a file in its own right; record it either way, because a
         // catalogued entry may point at the archive itself when the scanner stopped at max depth.
-        found.insert(rel, crate::hashing::hash_file(entry.path())?);
+        let hash = crate::hashing::hash_file(entry.path())
+            .with_context(|| format!("could not read {rel}"))?;
+        found.insert(rel, hash);
     }
 
     for row in cat.archive_entries(volume_id, archive_rel)? {
@@ -741,6 +757,27 @@ mod tests {
         // disk -- and that is enough to prove the catalogued chain "inner.zip › deep.txt".
         let tmp = tempfile::tempdir().unwrap();
         let (cat, dest) = nested_extracted_fixture(&tmp);
+        verify_destination(&cat, "vol-1", "bundle.zip", &dest, &test_limits()).unwrap();
+    }
+
+    #[test]
+    fn a_max_depth_truncated_nested_archive_verifies_by_its_own_hash() {
+        // When the scanner stops descending at `max_depth`, it catalogues the nested archive
+        // itself as a LEAF entry: chain = "inner.zip" (not "inner.zip › deep.txt"), hash =
+        // blake3 of inner.zip's own bytes. verify_destination must prove that row by hashing
+        // the archive file directly, not by descending into it -- this is the double-recording
+        // branch (`found.insert(rel, hash_file(...))` alongside the chain-based inserts) that
+        // makes an intentionally-truncated archive extractable at all.
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("bundle");
+        std::fs::create_dir_all(&dest).unwrap();
+        let inner_path = dest.join("inner.zip");
+        write_zip(&inner_path, &[("deep.txt", b"DEEP CONTENT")]);
+        let inner_hash = crate::hashing::hash_file(&inner_path).unwrap();
+        let inner_size = std::fs::metadata(&inner_path).unwrap().len() as i64;
+
+        let cat = catalog_with_entries(&tmp, &[("inner.zip", inner_size, inner_hash.as_str())]);
+
         verify_destination(&cat, "vol-1", "bundle.zip", &dest, &test_limits()).unwrap();
     }
 }
