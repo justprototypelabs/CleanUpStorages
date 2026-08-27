@@ -1109,6 +1109,60 @@ async fn api_archives(
     Ok(Json(out))
 }
 
+/// True when two filesystem paths name the same tree or one nests inside the other -- i.e. a scan
+/// of one and an extraction on the other could touch the same files. Compared as lowercased,
+/// separator-normalised strings rather than `Path::starts_with`, because Windows path components
+/// are case-insensitive (`E:\Data` and `e:\data` are the same drive) but `Path::starts_with`
+/// compares `OsStr` components exactly. Narrow and string-based on purpose -- this is the mutual
+/// exclusion check for #77's scan/extract race (see `api_extract` and `api_scan`), not a general
+/// path-identity utility.
+fn paths_overlap(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let norm = |p: &std::path::Path| {
+        p.to_string_lossy()
+            .to_ascii_lowercase()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_string()
+    };
+    let (a, b) = (norm(a), norm(b));
+    a.starts_with(&b) || b.starts_with(&a)
+}
+
+/// Pure half of `api_extract`'s scan guard, split out so it is testable without a live
+/// `ScanQueue` worker: `Some(refusal message)` when a currently running scan overlaps `mount`,
+/// naming the running scan's own path.
+fn scan_conflict_for_extract(
+    running_scan_path: Option<&str>,
+    mount: &std::path::Path,
+) -> Option<String> {
+    let path = running_scan_path?;
+    paths_overlap(std::path::Path::new(path), mount).then(|| {
+        format!("a scan of {path} is currently running; wait for it to finish before extracting")
+    })
+}
+
+/// Pure half of `api_scan`'s extract guard, split out for the same testability reason as
+/// `scan_conflict_for_extract`: `Some(refusal message)`, naming every conflicting job, when any
+/// extract job (running or pending) targets `volume_id`.
+fn extract_conflict_for_scan<'a>(
+    volume_id: &str,
+    jobs: impl Iterator<Item = &'a crate::quarantine_queue::QuarantineJobDto>,
+) -> Option<String> {
+    let conflicting: Vec<String> = jobs
+        .filter(|j| j.kind == "extract" && j.volume_id == volume_id)
+        .map(|j| j.label.clone())
+        .collect();
+    if conflicting.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "extract job(s) still queued or running on this drive: {}; wait for them to finish \
+             before scanning",
+            conflicting.join(", ")
+        ))
+    }
+}
+
 #[derive(Deserialize)]
 struct ExtractReq {
     volume_id: String,
@@ -1148,6 +1202,28 @@ async fn api_extract(
             format!("drive {} is not connected", body.volume_id),
         ));
     };
+
+    // Refuse while a scan of this same volume is running. Nothing stops a scan and an extraction
+    // from targeting the same drive at once: a scan can walk the destination folder between
+    // write_level and convert_archive_entries, hash the freshly extracted files, and catalogue
+    // them as loose rows at exactly the paths the conversion is about to claim -- the conversion
+    // then violates idx_files_loose_identity and rolls back, and cleanup deletes the destination,
+    // taking the rows the scan just wrote with it. Nothing is lost (the archive is untouched),
+    // but it is a confusing, expensive way to fail. Narrow fix: block the second writer from ever
+    // starting, the same way `run_job` in scan_queue.rs already blocks a second scan via
+    // `cat.running_scan()`.
+    if let Some(msg) = scan_conflict_for_extract(
+        state
+            .scan_queue
+            .status()
+            .running
+            .as_ref()
+            .map(|r| r.path.as_str()),
+        &mount,
+    ) {
+        return Err((StatusCode::CONFLICT, msg));
+    }
+
     let mut out = ExtractQueuedDto::default();
     for path in &body.paths {
         match crate::extract::scope_check(&cat, &mount, &body.volume_id, path).map_err(err500)? {
@@ -1680,6 +1756,27 @@ async fn api_scan(
         return Err((StatusCode::BAD_REQUEST, "path is required".into()));
     }
     let path = std::path::PathBuf::from(body.path.trim());
+
+    // Mirror of the guard in `api_extract`: refuse a scan of a volume that has extract jobs
+    // queued or running, naming them, rather than letting the two writers race (see
+    // `api_extract`'s doc comment for the concrete interleaving this prevents). The volume is
+    // found by which known mount this scan path falls under; an unrecognised path (e.g. the
+    // drive's first-ever scan) has no extract jobs against it yet, so it is let through.
+    let mounts = state.mounts.snapshot();
+    if let Some(volume_id) = mounts
+        .iter()
+        .find(|(_, mount)| paths_overlap(&path, mount))
+        .map(|(id, _)| id.clone())
+    {
+        let qstatus = state.quarantine_queue.status();
+        if let Some(msg) = extract_conflict_for_scan(
+            &volume_id,
+            qstatus.running.iter().chain(qstatus.pending.iter()),
+        ) {
+            return Err((StatusCode::CONFLICT, msg));
+        }
+    }
+
     let pos = state.scan_queue.enqueue(path, body.force);
     Ok(Json(ScanEnqueuedDto {
         queued_position: pos,
@@ -1922,6 +2019,78 @@ mod tests {
                 .collect(),
             allow_extensions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn paths_overlap_matches_nesting_regardless_of_case_or_separator() {
+        assert!(paths_overlap(
+            std::path::Path::new("E:\\Data"),
+            std::path::Path::new("e:/data")
+        ));
+        assert!(paths_overlap(
+            std::path::Path::new("E:\\Data\\sub\\folder"),
+            std::path::Path::new("E:\\Data")
+        ));
+        assert!(paths_overlap(
+            std::path::Path::new("E:\\Data"),
+            std::path::Path::new("E:\\Data\\sub\\folder")
+        ));
+        assert!(!paths_overlap(
+            std::path::Path::new("E:\\Data"),
+            std::path::Path::new("E:\\Other")
+        ));
+    }
+
+    #[test]
+    fn scan_conflict_for_extract_refuses_when_the_running_scan_overlaps_the_mount() {
+        let mount = std::path::Path::new("E:\\Data");
+        assert!(
+            scan_conflict_for_extract(None, mount).is_none(),
+            "nothing running"
+        );
+        assert!(
+            scan_conflict_for_extract(Some("D:\\Other"), mount).is_none(),
+            "different drive"
+        );
+        let msg =
+            scan_conflict_for_extract(Some("E:\\Data\\sub"), mount).expect("overlapping scan");
+        assert!(msg.contains("E:\\Data\\sub"), "must name the scan: {msg}");
+    }
+
+    #[test]
+    fn extract_conflict_for_scan_names_every_conflicting_job() {
+        let jobs = vec![
+            crate::quarantine_queue::QuarantineJobDto {
+                kind: "extract".into(),
+                volume_id: "vol-1".into(),
+                label: "bundle.zip".into(),
+            },
+            crate::quarantine_queue::QuarantineJobDto {
+                kind: "tree".into(),
+                volume_id: "vol-1".into(),
+                label: "some/folder".into(),
+            },
+            crate::quarantine_queue::QuarantineJobDto {
+                kind: "extract".into(),
+                volume_id: "vol-2".into(),
+                label: "other.zip".into(),
+            },
+        ];
+
+        assert!(
+            extract_conflict_for_scan("vol-3", jobs.iter()).is_none(),
+            "no jobs on this volume"
+        );
+        let msg = extract_conflict_for_scan("vol-1", jobs.iter()).expect("one conflicting job");
+        assert!(msg.contains("bundle.zip"), "must name the job: {msg}");
+        assert!(
+            !msg.contains("other.zip"),
+            "must not name a job on a different volume: {msg}"
+        );
+        assert!(
+            !msg.contains("some/folder"),
+            "must not name a non-extract job: {msg}"
+        );
     }
 
     #[test]
@@ -3189,6 +3358,46 @@ mod tests {
         )
         .await;
         assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn scan_is_refused_while_an_extract_job_is_queued_for_the_same_drive() {
+        // Deliberately does not spawn the quarantine queue's worker, so the enqueued job stays
+        // `pending` rather than racing to `running` -- that alone is enough to prove the api_scan
+        // guard (extract_conflict_for_scan) without a timing-dependent test.
+        let (_t, _db, state) = seed_dupes();
+        state
+            .quarantine_queue
+            .enqueue_extract("vol-1".to_string(), "bundle.zip".to_string());
+        let drive = state.mounts.resolve("vol-1").unwrap();
+
+        let app = build_router_with(state);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/scan")
+                    .header("content-type", "application/json")
+                    .header("x-cleanup-token", "T")
+                    .body(Body::from(
+                        serde_json::json!({"path": drive.to_string_lossy(), "force": false})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), 100_000)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+
+        assert_eq!(status, StatusCode::CONFLICT, "body {body}");
+        assert!(
+            body.contains("bundle.zip"),
+            "must name the conflicting job: {body}"
+        );
     }
 
     #[tokio::test]
