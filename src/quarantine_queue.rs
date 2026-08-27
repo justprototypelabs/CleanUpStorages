@@ -1071,27 +1071,24 @@ mod tests {
         q.enqueue_extract("vol-1".into(), "bundle.zip".into());
 
         // Concurrent observation while the two-job chain (parent, then its nested child) drains.
-        // `seen_nested_queued`: proves the nested job actually reached the queue (`pending` or
-        // `running`) at `depth + 1` -- the finding's first two asks ("lands in pending", "at the
-        // correct depth", the latter proven by the eventual refusal message below).
+        //
+        // Note what is deliberately NOT polled for here: the nested job's presence in `pending` or
+        // `running`. That state is transient -- a depth-refused job is popped and finished without
+        // touching the disk -- so on a fast machine it can appear and vanish between two polls. An
+        // earlier version of this test asserted on it and failed on macOS CI for exactly that
+        // reason: it polled a proxy instead of the effect. The durable proof lives in `recent`
+        // below, and is strictly stronger -- a job that never reached the queue cannot record a
+        // result, and only a job carrying depth 2 can be refused against a limit of 1.
+        //
         // `premature_snapshot`: proves the drained-window half -- that a rebuild/snapshot artifact
         // never appears while the nested job's own result is still missing from `recent`. Under
         // the pre-fix ordering (`drained` computed in the same lock scope that recorded the
         // parent's result, before the nested job was enqueued), the parent's completion would
         // wrongly look "drained" and fire the rebuild/snapshot while the nested job either had not
         // yet been enqueued or was still waiting to run -- exactly the state this polls for.
-        let mut seen_nested_queued = false;
         let mut premature_snapshot = false;
         for _ in 0..800 {
             let s = q.status();
-            let nested_present = s
-                .pending
-                .iter()
-                .chain(s.running.iter())
-                .any(|j| j.kind == "extract" && j.label == "bundle/inner.zip");
-            if nested_present {
-                seen_nested_queued = true;
-            }
             let snapshot_exists = std::fs::read_dir(&backups).map(|d| d.count()).unwrap_or(0) > 0;
             if snapshot_exists && s.recent.len() < 2 {
                 premature_snapshot = true;
@@ -1108,10 +1105,6 @@ mod tests {
         }
         drop(_g);
 
-        assert!(
-            seen_nested_queued,
-            "the nested archive `bundle/inner.zip` never appeared in the queue at all"
-        );
         assert!(
             !premature_snapshot,
             "a rebuild/snapshot artifact appeared before the nested job's result was recorded -- \
