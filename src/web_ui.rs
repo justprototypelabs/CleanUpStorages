@@ -914,12 +914,16 @@ pub fn review_page(csrf: &str) -> String {
         <option value="104857600">100 MB</option>
       </select></label>
   </div>
+  <!-- The queue indicator sits ABOVE every section and outside all of them. It used to live inside
+       "Identical folders", which is hidden whenever that list is empty -- so the one moment the
+       reviewer most needs it (they just confirmed the last folder, and the worker is moving it)
+       was exactly when it disappeared. -->
+  <div class="mut" id="qstatus" style="font-size:12.5px;margin-bottom:14px"></div>
   <section id="treesec" style="display:none;margin-bottom:26px">
     <h2 style="font-size:15px;margin:0 0 4px">Identical folders</h2>
     <p class="mut" style="font-size:12px;margin:0 0 12px">Whole folders whose contents match exactly.
       Confirming one moves the entire folder to <span class="mono">_ToDelete</span> in a single
       rename — the other copy stays where it is, and nothing is deleted until you purge.</p>
-    <div class="mut" id="qstatus" style="display:none;font-size:12.5px;margin-bottom:10px"></div>
   <div id="treelist"></div>
   <div id="treeblocked"></div>
   </section>
@@ -1298,11 +1302,15 @@ async function pollQuarantine(){
     let st; try{ st=await apiGet("/api/quarantine/status"); }catch(e){ return; }
     const busy=!!st.running || st.pending.length>0;
     const bar=$("#qstatus");
+    // An idle state is rendered too, rather than hiding the bar: "nothing is shown" and "nothing is
+    // running" looked identical, so a reviewer who had just confirmed something could not tell
+    // whether the work was queued, finished, or lost.
     if(busy){
       const now=st.running?st.running.label:"";
       bar.textContent="Quarantining "+now+(st.pending.length?" — "+st.pending.length+" queued":"");
-      bar.style.display="";
-    }else{ bar.style.display="none"; }
+    }else{
+      bar.textContent="Quarantine queue: nothing running.";
+    }
     // `recent` is capped server-side at 50 and reordered newest-first, so filtering it whole would
     // let one stale failure from forty confirms ago pin the message forever. `seq` is monotonic and
     // assigned once, in order, so "newer than the highest seq already reported" is exactly the set
@@ -1329,7 +1337,10 @@ async function pollQuarantine(){
     if(skipped) m+=" "+skipped+" kept (not moved — see the action log).";
     if(failed.length) m+=" "+failed.length+" could not be quarantined — "+failed[0].error_message;
     if(m) $("#msg").textContent=m.trim();
-    if(qWasBusy && !busy){ clearInterval(qTimer); qTimer=null; await loadTrees(); await loadClusters(); }
+    // The poller keeps running once the queue drains. It used to stop itself, which meant a job
+    // queued from the Extract page or a second tab never appeared here at all; the endpoint reads
+    // in-memory queue state, so polling it costs nothing worth saving.
+    if(qWasBusy && !busy){ await loadTrees(); await loadClusters(); }
     qWasBusy=busy;
   };
   await tick();
