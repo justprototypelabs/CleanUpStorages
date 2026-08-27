@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod category;
 pub mod commands;
 pub mod config;
+pub mod extract;
 pub mod hashing;
 pub mod image_preview;
 pub mod mounts;

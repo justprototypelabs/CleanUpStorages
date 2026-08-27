@@ -27,6 +27,18 @@ sysinfo = "0.30"
 anyhow = "1"
 thiserror = "1"
 zip = "2"
+# `compress` feature is needed only by tests, to build a .7z fixture in-process without shelling
+# out to a 7-Zip binary CI does not have. The spec named `sevenz-rust`; that crate's last release
+# was 0.6.1 in 2023, so this is the maintained fork. Cargo's MSRV-aware resolver already pins this
+# to 0.10.x here, because 0.22.x declares rustc 1.93 and this project's rust-version is 1.82.
+# Because this is a normal (not dev-) dependency, Cargo has no per-profile way to gate the feature
+# to tests only -- `compress` ships the 7z ENCODER into the release binary too, even though nothing
+# in src/ ever writes a .7z (extraction only reads/decodes one). That is a known, accepted cost, not
+# an oversight: feature unification means splitting this into a dev-dependency-only `compress`
+# would require a second, differently-featured `sevenz-rust2` entry, which Cargo does not support
+# cleanly for a single crate at two versions/feature-sets. Revisit only if binary size becomes a
+# real complaint.
+sevenz-rust2 = { version = "0.10", features = ["compress"] }
 image = "0.25"
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }

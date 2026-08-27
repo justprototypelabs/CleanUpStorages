@@ -66,14 +66,30 @@ pub struct QuarantineStatus {
 }
 
 enum Job {
-    Tree { volume_id: String, path: String },
-    Files { volume_id: String, ids: Vec<i64> },
+    Tree {
+        volume_id: String,
+        path: String,
+    },
+    Files {
+        volume_id: String,
+        ids: Vec<i64>,
+    },
+    /// Extract one archive, verify it, and quarantine the original. `depth` is 1 for an archive
+    /// the user picked and increments for each nested archive the previous level produced, so the
+    /// recursion is bounded by `ArchiveLimits::max_depth` exactly as the scanner's descent is.
+    Extract {
+        volume_id: String,
+        path: String,
+        depth: usize,
+    },
 }
 
 impl Job {
     fn volume_id(&self) -> &str {
         match self {
-            Job::Tree { volume_id, .. } | Job::Files { volume_id, .. } => volume_id,
+            Job::Tree { volume_id, .. }
+            | Job::Files { volume_id, .. }
+            | Job::Extract { volume_id, .. } => volume_id,
         }
     }
 
@@ -81,6 +97,7 @@ impl Job {
         match self {
             Job::Tree { .. } => "tree",
             Job::Files { .. } => "files",
+            Job::Extract { .. } => "extract",
         }
     }
 
@@ -95,6 +112,7 @@ impl Job {
                     if ids.len() == 1 { "" } else { "s" }
                 )
             }
+            Job::Extract { path, .. } => path.clone(),
         }
     }
 
@@ -132,13 +150,31 @@ impl Inner {
 enum Work {
     Tree(String),
     Files(Vec<i64>),
+    Extract { path: String, depth: usize },
 }
 
-/// The shape both engines collapse to once they succeed.
+/// The shape all three engines collapse to once they succeed.
 struct Done {
     files_updated: usize,
     skipped: usize,
     dest: Option<String>,
+    /// Archives this job wrote that are themselves extractable, with the depth they sit at.
+    nested: Vec<(String, usize)>,
+}
+
+/// Pure refusal check for `max_archive_depth`: `Some(message)` when `depth` has gone past `max`,
+/// `None` when it is still within bounds. Split out from `Work::Extract`'s arm so the "stopping
+/// point must be reported, not silent" requirement can be tested directly, without spinning up a
+/// worker, a catalogue, or a mounted drive just to check a string.
+fn depth_refusal(path: &str, depth: usize, max: usize) -> Option<String> {
+    if depth > max {
+        Some(format!(
+            "{path} sits {depth} archives deep, past the max_archive_depth of {max}; \
+             extract it by hand or raise the limit"
+        ))
+    } else {
+        None
+    }
 }
 
 pub struct QuarantineQueue {
@@ -184,7 +220,7 @@ impl QuarantineQueue {
                     volume_id: v,
                     path: p,
                 } => v == &volume_id && p == &path,
-                Job::Files { .. } => false,
+                Job::Files { .. } | Job::Extract { .. } => false,
             });
             if dup {
                 return inner.pending.len();
@@ -228,6 +264,44 @@ impl QuarantineQueue {
         Some(pos)
     }
 
+    /// Add an archive extraction; returns how many are ahead of it (0 = starts next).
+    pub fn enqueue_extract(self: &Arc<Self>, volume_id: String, path: String) -> usize {
+        self.enqueue_extract_at_depth(volume_id, path, 1)
+    }
+
+    /// Shared by `enqueue_extract` (depth 1, a user's click) and the post-job enqueue of nested
+    /// archives a level wrote (depth + 1). De-duplicates the same way the other kinds do: an
+    /// archive already queued, pending or running, must not be queued twice.
+    fn enqueue_extract_at_depth(
+        self: &Arc<Self>,
+        volume_id: String,
+        path: String,
+        depth: usize,
+    ) -> usize {
+        let pos = {
+            let mut inner = self.inner.lock().unwrap();
+            let dup = inner.jobs().any(|j| match j {
+                Job::Extract {
+                    volume_id: v,
+                    path: p,
+                    ..
+                } => v == &volume_id && p == &path,
+                _ => false,
+            });
+            if dup {
+                return inner.pending.len();
+            }
+            inner.pending.push_back(Job::Extract {
+                volume_id,
+                path,
+                depth,
+            });
+            inner.pending.len() - 1 + inner.running.is_some() as usize
+        };
+        self.notify.notify_one();
+        pos
+    }
+
     pub fn status(&self) -> QuarantineStatus {
         let inner = self.inner.lock().unwrap();
         QuarantineStatus {
@@ -266,6 +340,10 @@ impl QuarantineQueue {
         let work = match &job {
             Job::Tree { path, .. } => Work::Tree(path.clone()),
             Job::Files { ids, .. } => Work::Files(ids.clone()),
+            Job::Extract { path, depth, .. } => Work::Extract {
+                path: path.clone(),
+                depth: *depth,
+            },
         };
         {
             let mut inner = self.inner.lock().unwrap();
@@ -292,6 +370,7 @@ impl QuarantineQueue {
                         files_updated: out.files_updated,
                         skipped: 0,
                         dest: Some(out.dest_relative_path),
+                        nested: Vec::new(),
                     }
                 }
                 Work::Files(ids) => {
@@ -300,25 +379,54 @@ impl QuarantineQueue {
                         files_updated: out.quarantined,
                         skipped: out.skipped,
                         dest: None,
+                        nested: Vec::new(),
+                    }
+                }
+                Work::Extract { path, depth } => {
+                    let cfg = crate::config::Config::default_paths()?;
+                    let limits = crate::archive::ArchiveLimits::from_config(&cfg);
+                    if let Some(msg) = depth_refusal(&path, depth, limits.max_depth) {
+                        anyhow::bail!(msg);
+                    }
+                    let out =
+                        crate::extract::extract_archive(&cat, &mount, &vid, &path, &limits, now)?;
+                    Done {
+                        files_updated: out.entries_converted,
+                        skipped: usize::from(!out.quarantined),
+                        dest: Some(out.dest_relative_path),
+                        nested: out
+                            .nested_archives
+                            .into_iter()
+                            .map(|p| (p, depth + 1))
+                            .collect(),
                     }
                 }
             })
         })
         .await;
 
+        // Lifted out of `Done` here, before the match below consumes it, so it survives past the
+        // point the result is recorded. `nested` is drained (see below) only once the result is
+        // pushed, so a crash between the two would at worst lose queued nested archives rather
+        // than the record of what this job itself did.
+        let mut nested: Vec<(String, usize)> = Vec::new();
+
         // `seq` is assigned below, under the lock, so it is truly monotonic across concurrent
         // completions; 0 here is just a placeholder for the field.
         let mut result = match joined {
-            Ok(Ok(d)) => QuarantineResult {
-                seq: 0,
-                kind,
-                volume_id: volume_id.clone(),
-                label,
-                files_updated: d.files_updated,
-                skipped: d.skipped,
-                dest: d.dest,
-                error_message: None,
-            },
+            Ok(Ok(d)) => {
+                nested = d.nested;
+                QuarantineResult {
+                    seq: 0,
+                    kind,
+                    volume_id: volume_id.clone(),
+                    label,
+                    files_updated: d.files_updated,
+                    skipped: d.skipped,
+                    dest: d.dest,
+                    error_message: None,
+                }
+            }
             Ok(Err(e)) => QuarantineResult {
                 seq: 0,
                 kind,
@@ -341,7 +449,7 @@ impl QuarantineQueue {
             },
         };
 
-        let (drained, touched) = {
+        {
             let mut inner = self.inner.lock().unwrap();
             inner.running = None;
             inner.touched.insert(volume_id.clone());
@@ -351,6 +459,19 @@ impl QuarantineQueue {
             while inner.recent.len() > RECENT_CAP {
                 inner.recent.pop_back();
             }
+        }
+
+        // Enqueue what this job produced now that its own result is recorded (rather than inside
+        // extract.rs), so the queue stays the only thing that knows about the queue. This must
+        // happen BEFORE the drained check below: a nested archive still waiting is "not drained",
+        // and checking drained first would let the post-drain rebuild fire one job too early, with
+        // a nested extraction sitting in `pending` behind it.
+        for (path, depth) in nested {
+            self.enqueue_extract_at_depth(volume_id.clone(), path, depth);
+        }
+
+        let (drained, touched) = {
+            let mut inner = self.inner.lock().unwrap();
             let drained = inner.pending.is_empty();
             let touched = if drained {
                 std::mem::take(&mut inner.touched)
@@ -774,6 +895,250 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         panic!("draining the queue must snapshot the catalogue it mutated");
+    }
+
+    #[test]
+    fn extract_jobs_queue_behind_quarantines_and_report_their_position() {
+        let q = queue();
+        assert_eq!(q.enqueue_tree("v".into(), "a".into()), 0);
+        assert_eq!(q.enqueue_extract("v".into(), "b.zip".into()), 1);
+        let s = q.status();
+        assert_eq!(s.pending[1].kind, "extract");
+        assert_eq!(s.pending[1].label, "b.zip");
+    }
+
+    #[test]
+    fn the_same_archive_is_never_queued_twice() {
+        let q = queue();
+        q.enqueue_extract("v".into(), "b.zip".into());
+        q.enqueue_extract("v".into(), "b.zip".into());
+        assert_eq!(
+            q.status().pending.len(),
+            1,
+            "a double click is one decision"
+        );
+    }
+
+    #[test]
+    fn depth_refusal_reports_the_path_depth_and_limit_when_over_and_stays_silent_when_within() {
+        // The stopping point at `max_archive_depth` must be reported, not silently swallowed --
+        // this is the pure helper `Work::Extract` calls before doing any real work.
+        assert_eq!(
+            depth_refusal("a.zip", 1, 8),
+            None,
+            "top-level archive is depth 1"
+        );
+        assert_eq!(
+            depth_refusal("bundle/inner.zip", 8, 8),
+            None,
+            "exactly at the limit is fine"
+        );
+        let msg = depth_refusal("bundle/inner/deeper.zip", 9, 8)
+            .expect("depth past the limit must be refused");
+        assert!(
+            msg.contains("bundle/inner/deeper.zip"),
+            "names the path: {msg}"
+        );
+        assert!(msg.contains('9'), "names the depth: {msg}");
+        assert!(msg.contains('8'), "names the limit: {msg}");
+    }
+
+    /// Writes a zip at `path` containing `files`, using the same helper shape as `extract.rs`'s
+    /// test fixtures (kept local rather than shared: `extract.rs`'s version is private to its own
+    /// test module).
+    fn write_zip(path: &std::path::Path, files: &[(&str, &[u8])]) {
+        use std::io::Write;
+        let f = std::fs::File::create(path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts: zip::write::FileOptions<()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, bytes) in files {
+            zw.start_file(*name, opts).unwrap();
+            zw.write_all(bytes).unwrap();
+        }
+        zw.finish().unwrap();
+    }
+
+    /// A real mounted "drive" with `bundle.zip` containing `inner.zip` containing `deep.txt`,
+    /// catalogued by running the real (recursive) `archive::scan_archive` over the real bytes on
+    /// disk -- so the catalogue this test exercises is exactly what a genuine scan would have
+    /// produced, never hand-written, and the extraction under test is the genuine
+    /// `extract::extract_archive`, not a stub.
+    fn nested_archive_drive() -> (tempfile::TempDir, std::path::PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let drive = tmp.path().join("driveA");
+        std::fs::create_dir_all(&drive).unwrap();
+        std::fs::write(drive.join(crate::volume::MARKER), "vol-1").unwrap();
+
+        let inner_tmp = tmp.path().join("inner_tmp.zip");
+        write_zip(&inner_tmp, &[("deep.txt", b"DEEP CONTENT")]);
+        let inner_bytes = std::fs::read(&inner_tmp).unwrap();
+        std::fs::remove_file(&inner_tmp).unwrap();
+        let bundle_path = drive.join("bundle.zip");
+        write_zip(&bundle_path, &[("inner.zip", &inner_bytes)]);
+
+        let db = tmp.path().join("c.db");
+        let cat = crate::catalog::Catalog::open(&db).unwrap();
+        cat.upsert_volume(&crate::catalog::models::Volume {
+            volume_id: "vol-1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+        cat.upsert_file(
+            &crate::catalog::models::NewFile {
+                volume_id: "vol-1".into(),
+                relative_path: "bundle.zip".into(),
+                filename: "bundle.zip".into(),
+                extension: "zip".into(),
+                size_bytes: std::fs::metadata(&bundle_path).unwrap().len() as i64,
+                content_hash: crate::hashing::hash_file(&bundle_path).unwrap(),
+                created_time: None,
+                modified_time: None,
+                accessed_time: None,
+                category: crate::category::Category::from_extension("zip"),
+                container_chain: None,
+            },
+            1,
+        )
+        .unwrap();
+        // Generous limits for the SCAN itself (cataloguing both levels): distinct from the low
+        // runtime `max_archive_depth` this test later sets via settings.json, which governs what
+        // the queue's own extraction jobs are willing to descend into, not what gets catalogued.
+        let scan_limits = crate::archive::ArchiveLimits {
+            max_depth: 8,
+            buffer_max_bytes: 2 * 1024 * 1024 * 1024,
+            total_buffer_bytes: 2 * 1024 * 1024 * 1024,
+            entry_max_bytes: Some(64 * 1024 * 1024 * 1024),
+            ratio_cap: 10_000,
+            deny_extensions: crate::config::DEFAULT_DENY
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            allow_extensions: Vec::new(),
+        };
+        let f = std::fs::File::open(&bundle_path).unwrap();
+        let scanned = crate::archive::scan_archive(std::io::BufReader::new(f), &scan_limits);
+        for e in scanned.entries {
+            cat.upsert_archive_entry("vol-1", "bundle.zip", &e, None, 1)
+                .unwrap();
+        }
+        drop(cat);
+
+        (tmp, drive, db)
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "ENV_GUARD is a test-only serialization guard (unit-value Mutex) around the \
+            process-global CLEANUPSTORAGES_DATA_DIR var, not a resource read across the await; \
+            holding it for the whole async test body -- which polls the real worker task -- is \
+            the point, matching the existing pattern in web.rs's tests"
+    )]
+    async fn a_nested_archive_from_a_real_extraction_is_enqueued_and_the_drain_waits_for_it() {
+        // This exercises the exact seam flagged for scrutiny: a real `extract_archive` call whose
+        // `ExtractOutcome.nested_archives` is non-empty, run through `run_job`, proving the nested
+        // `Job::Extract` actually lands in the queue at `depth + 1` and that the post-drain
+        // rebuild/snapshot does not fire while it is still outstanding.
+        //
+        // `max_archive_depth` is pinned to 1 via settings.json so the nested job (real depth 2)
+        // is refused -- not merely "does not error," but refused with a message naming exactly
+        // "2" and "1". That is a stronger, more specific proof that `depth` was threaded as
+        // `parent_depth + 1` than "the nested job merely ran under the default limit" would be:
+        // a reset-to-1 bug and a correctly-threaded depth=2 both pass under a generous default,
+        // but only the correct one is refused against a limit of 1.
+        let _g = crate::config::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let data_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            data_dir.path().join("settings.json"),
+            br#"{"max_archive_depth": 1}"#,
+        )
+        .unwrap();
+        let prev = std::env::var("CLEANUPSTORAGES_DATA_DIR").ok();
+        std::env::set_var("CLEANUPSTORAGES_DATA_DIR", data_dir.path());
+
+        let (_t, drive, db) = nested_archive_drive();
+        let backups = db.parent().unwrap().join("catalog.backups");
+        let mut mounts = std::collections::HashMap::new();
+        mounts.insert("vol-1".to_string(), drive.clone());
+        let q = QuarantineQueue::new(db, crate::mounts::MountResolver::Fixed(mounts));
+        tokio::spawn(q.clone().run_worker());
+        q.enqueue_extract("vol-1".into(), "bundle.zip".into());
+
+        // Concurrent observation while the two-job chain (parent, then its nested child) drains.
+        //
+        // Note what is deliberately NOT polled for here: the nested job's presence in `pending` or
+        // `running`. That state is transient -- a depth-refused job is popped and finished without
+        // touching the disk -- so on a fast machine it can appear and vanish between two polls. An
+        // earlier version of this test asserted on it and failed on macOS CI for exactly that
+        // reason: it polled a proxy instead of the effect. The durable proof lives in `recent`
+        // below, and is strictly stronger -- a job that never reached the queue cannot record a
+        // result, and only a job carrying depth 2 can be refused against a limit of 1.
+        //
+        // `premature_snapshot`: proves the drained-window half -- that a rebuild/snapshot artifact
+        // never appears while the nested job's own result is still missing from `recent`. Under
+        // the pre-fix ordering (`drained` computed in the same lock scope that recorded the
+        // parent's result, before the nested job was enqueued), the parent's completion would
+        // wrongly look "drained" and fire the rebuild/snapshot while the nested job either had not
+        // yet been enqueued or was still waiting to run -- exactly the state this polls for.
+        let mut premature_snapshot = false;
+        for _ in 0..800 {
+            let s = q.status();
+            let snapshot_exists = std::fs::read_dir(&backups).map(|d| d.count()).unwrap_or(0) > 0;
+            if snapshot_exists && s.recent.len() < 2 {
+                premature_snapshot = true;
+            }
+            if s.running.is_none() && s.pending.is_empty() && s.recent.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        match prev {
+            Some(v) => std::env::set_var("CLEANUPSTORAGES_DATA_DIR", v),
+            None => std::env::remove_var("CLEANUPSTORAGES_DATA_DIR"),
+        }
+        drop(_g);
+
+        assert!(
+            !premature_snapshot,
+            "a rebuild/snapshot artifact appeared before the nested job's result was recorded -- \
+             the drain fired one job too early"
+        );
+
+        let recent = q.status().recent;
+        assert_eq!(recent.len(), 2, "both the parent and the nested job ran");
+        let nested = recent
+            .iter()
+            .find(|r| r.label == "bundle/inner.zip")
+            .expect("the nested archive must have run as its own job");
+        assert_eq!(nested.kind, "extract");
+        assert_eq!(nested.volume_id, "vol-1");
+        let msg = nested
+            .error_message
+            .as_deref()
+            .expect("depth 2 must be refused against max_archive_depth=1");
+        assert!(msg.contains("bundle/inner.zip"), "names the path: {msg}");
+        assert!(
+            msg.contains('2'),
+            "names depth 2, proving `depth` was threaded as parent_depth + 1: {msg}"
+        );
+        assert!(msg.contains('1'), "names the limit 1: {msg}");
+
+        let parent = recent
+            .iter()
+            .find(|r| r.label == "bundle.zip")
+            .expect("the parent extraction must have run and recorded a result");
+        assert!(
+            parent.error_message.is_none(),
+            "the top-level archive (depth 1) must not be refused: {:?}",
+            parent.error_message
+        );
     }
 
     #[tokio::test]

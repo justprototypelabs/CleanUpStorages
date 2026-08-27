@@ -18,8 +18,17 @@ pub struct ArchiveLimits {
     /// CATALOGUE: the largest leaf file we will record. `None` is unlimited, and safe: leaves are
     /// stream-hashed in 64 KiB chunks, so their size costs no memory.
     pub entry_max_bytes: Option<u64>,
-    /// TIME: declared uncompressed/compressed. With a generous leaf ceiling this is what stops a
-    /// genuine bomb streaming for a long time before its size cap trips.
+    /// TIME, for zip only: declared uncompressed/compressed. With a generous leaf ceiling this is
+    /// what stops a genuine zip bomb streaming for a long time before its size cap trips.
+    ///
+    /// Does NOT apply to 7z. A per-entry compressed size is only reliable for the first file in
+    /// each solid-compression folder -- every other entry in that folder reads back a declared
+    /// `compressed_size` of 0, which a ratio computed from it would either divide-by-a-bogus-1 or
+    /// have to skip outright, and ordinary multi-file `.7z` archives are usually solid, so skipping
+    /// is what happens in practice for nearly every entry. See the skip site in `scan_7z_level` for
+    /// the coarser (folder-level) check that was available instead and was not taken. For 7z,
+    /// `entry_max_bytes` is therefore the SOLE guard: a pathological entry can be streamed and
+    /// decompressed all the way up to that ceiling (64 GiB by default) before being rejected.
     pub ratio_cap: u64,
     /// Zip-format extensions always treated as a leaf, never descended -- checked first and always
     /// wins, including over `zip` itself.
@@ -90,15 +99,19 @@ pub enum Descent {
     Unrecognised,
 }
 
-/// The naming policy for a file already established to be zip format.
+/// The naming policy for a file already established to be zip or 7z format.
 ///
-/// A renamed zip and a `.docx` are indistinguishable by magic bytes alone, so the difference has to
-/// be an explicit rule rather than something implied by a policy name.
+/// A renamed zip/7z and a `.docx` are indistinguishable by magic bytes alone, so the difference has
+/// to be an explicit rule rather than something implied by a policy name.
 ///
-/// The deny-list is checked FIRST and always wins -- including over `zip` itself. Silently
-/// overriding an explicit choice would be worse than obeying one the user can see and undo.
+/// The deny-list is checked FIRST and always wins -- including over `zip` and `7z` themselves.
+/// Silently overriding an explicit choice would be worse than obeying one the user can see and undo.
 ///
-/// `extension` is lowercase, without a dot ("" when the name has none).
+/// `zip` and `7z` are both natively descended, same as each other: there is no `DEFAULT_ALLOW`
+/// constant, and `archive_allow_extensions` defaults to empty, so making 7z opt-in via the allow
+/// list would have shipped a new default into every existing user's `settings.json` semantics --
+/// the allow list is user-editable state, and that would have been the more surprising change. A
+/// user who wants `.7z` files left whole adds `7z` to the deny list instead.
 ///
 /// `extension` is lowercase and dot-free ("" when the name has none). A dotted value never
 /// matches either list and therefore reads as `Unrecognised` -- safe, but wrong, so callers
@@ -109,7 +122,7 @@ pub fn descent_for(extension: &str, deny: &[String], allow: &[String]) -> Descen
     if has(deny) {
         return Descent::Leaf;
     }
-    if ext == "zip" || has(allow) {
+    if ext == "zip" || ext == "7z" || has(allow) {
         return Descent::Descend;
     }
     Descent::Unrecognised
@@ -126,14 +139,27 @@ pub fn looks_like_zip(prefix: &[u8]) -> bool {
     )
 }
 
-/// Read up to 4 leading bytes from a stream, reporting whether they look like a zip. The bytes are
-/// returned so a caller reading a non-seekable stream (an archive entry) can chain them back --
-/// dropping them would silently truncate the content hash. `pub(crate)` so the scanner's top-level
-/// detection shares this instead of re-implementing the same 4-byte loop.
-pub(crate) fn peek4<R: Read>(r: &mut R) -> std::io::Result<(Vec<u8>, bool)> {
-    let mut buf = [0u8; 4];
+/// The 7z format signature: `37 7A BC AF 27 1C`, always the first six bytes of a 7z file (unlike
+/// zip, 7z has no prefixed/self-extracting variant this scanner needs to detect, so no tail check
+/// is needed alongside this).
+const SEVENZ_SIGNATURE: [u8; 6] = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
+
+/// True if these leading bytes carry a 7z signature. By content, not by extension -- the same
+/// reasoning as `looks_like_zip`: a renamed `.7z` is still a 7z, and nothing today lies about being
+/// one, but the check should not assume the filename is honest either.
+pub fn looks_like_7z(prefix: &[u8]) -> bool {
+    prefix.starts_with(&SEVENZ_SIGNATURE)
+}
+
+/// Read up to 6 leading bytes from a stream (6, not 4: the longer of the zip and 7z signatures),
+/// reporting whether they look like a zip and/or a 7z. The bytes are returned so a caller reading a
+/// non-seekable stream (an archive entry) can chain them back -- dropping them would silently
+/// truncate the content hash. `pub(crate)` so the scanner's top-level detection shares this instead
+/// of re-implementing the same peek loop.
+pub(crate) fn peek6<R: Read + ?Sized>(r: &mut R) -> std::io::Result<(Vec<u8>, bool, bool)> {
+    let mut buf = [0u8; 6];
     let mut filled = 0;
-    while filled < 4 {
+    while filled < 6 {
         match r.read(&mut buf[filled..])? {
             0 => break,
             n => filled += n,
@@ -141,7 +167,8 @@ pub(crate) fn peek4<R: Read>(r: &mut R) -> std::io::Result<(Vec<u8>, bool)> {
     }
     let head = buf[..filled].to_vec();
     let is_zip = looks_like_zip(&head);
-    Ok((head, is_zip))
+    let is_7z = looks_like_7z(&head);
+    Ok((head, is_zip, is_7z))
 }
 
 /// The largest an End Of Central Directory record plus its trailing comment can occupy: a fixed
@@ -243,6 +270,11 @@ fn hash_capped<R: Read>(mut reader: R, cap: u64) -> Result<(String, u64), String
 /// Scan an archive (recursively) from a seekable reader. Leaf files are stream-hashed; nested
 /// archives are buffered (bounded by `limits.entry_max_bytes`) and descended into up to
 /// `limits.max_depth` levels. Entries exceeding the zip-bomb caps are skipped with an error note.
+///
+/// Format is decided by content, not by the caller: the reader may hold a zip or a 7z, and
+/// `scan_level` sniffs the signature itself, exactly as the entry-level nested-archive check below
+/// does for entries found while already inside one. This is what lets a 7z nested inside a zip (or
+/// vice versa) recurse correctly with no special-casing at the call site.
 pub fn scan_archive<R: Read + Seek>(reader: R, limits: &ArchiveLimits) -> ArchiveScanResult {
     let mut result = ArchiveScanResult::default();
     let mut budget = limits.total_buffer_bytes;
@@ -250,11 +282,162 @@ pub fn scan_archive<R: Read + Seek>(reader: R, limits: &ArchiveLimits) -> Archiv
     result
 }
 
-/// Scan one archive level. `chain_prefix` is the container chain of THIS archive ("" at top level);
-/// `depth` is 1 for a top-level archive. Recurses into nested `.zip` entries until `max_depth`.
+/// Scan one archive level, dispatching on the container's own content signature. `chain_prefix` is
+/// the container chain of THIS archive ("" at top level); `depth` is 1 for a top-level archive.
 /// `budget` is the bytes still available for buffering nested archives; it is shared by every level
 /// of one descent, so ancestors' live buffers count against their descendants.
 fn scan_level<R: Read + Seek>(
+    mut reader: R,
+    chain_prefix: &str,
+    depth: usize,
+    limits: &ArchiveLimits,
+    budget: &mut u64,
+    result: &mut ArchiveScanResult,
+) {
+    let mut head = [0u8; 6];
+    let mut filled = 0;
+    while filled < 6 {
+        match reader.read(&mut head[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) => {
+                result
+                    .errors
+                    .push((chain_prefix.to_string(), format!("read error: {e}")));
+                return;
+            }
+        }
+    }
+    if let Err(e) = reader.seek(std::io::SeekFrom::Start(0)) {
+        result
+            .errors
+            .push((chain_prefix.to_string(), format!("seek error: {e}")));
+        return;
+    }
+    if looks_like_7z(&head[..filled]) {
+        scan_7z_level(reader, chain_prefix, depth, limits, budget, result);
+    } else {
+        scan_zip_level(reader, chain_prefix, depth, limits, budget, result);
+    }
+}
+
+/// One archive entry already known to be a file, with its leading bytes already peeked (`head`).
+/// If those bytes say it is a nested archive, buffer it (bounded by the shared `budget`) and
+/// recurse through `scan_level`; the recursion re-sniffs the buffer, so the nested archive's own
+/// format need not be known here. Otherwise stream-hash it as a leaf. Shared by the zip and 7z
+/// entry loops so both formats recurse identically and pay into the same buffer budget.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each parameter is an independent scan input; grouping them into a struct would add \
+        indirection without reducing real complexity (same rationale as scan_volume_with_progress)"
+)]
+fn handle_entry<R: Read>(
+    chain: String,
+    filename: String,
+    extension: String,
+    head: Vec<u8>,
+    is_nested_archive: bool,
+    entry: R,
+    depth: usize,
+    limits: &ArchiveLimits,
+    budget: &mut u64,
+    result: &mut ArchiveScanResult,
+) {
+    // Chain the peeked bytes back in front, so both branches below see the entire entry.
+    let mut entry = std::io::Cursor::new(head).chain(entry);
+
+    if is_nested_archive {
+        // Nested archive: buffer it (bounded) so we can BOTH hash it and re-open it with Seek
+        // to recurse. Only archives are buffered — large leaf files stream (see else branch).
+        // Cap this buffer by whatever the whole descent has left, not just the per-entry limit.
+        let cap = limits.buffer_max_bytes.min(*budget);
+        if cap == 0 {
+            result.errors.push((
+                chain,
+                format!(
+                    "nested-archive buffer budget exhausted ({} bytes total)",
+                    limits.total_buffer_bytes
+                ),
+            ));
+            return;
+        }
+        let bytes = match read_capped(&mut entry, cap) {
+            Ok(b) => b,
+            Err(reason) => {
+                // Budget pressure from legitimate ancestors is not a bomb; saying so would
+                // send the user hunting for a hostile file that does not exist.
+                let reason = if cap < limits.buffer_max_bytes {
+                    format!(
+                        "nested archive skipped: only {cap} of the {} byte buffer budget \
+                         remained (ancestor archives hold the rest)",
+                        limits.total_buffer_bytes
+                    )
+                } else {
+                    reason
+                };
+                result.errors.push((chain, reason));
+                return;
+            }
+        };
+        let mut slice: &[u8] = &bytes;
+        let content_hash = match hashing::hash_reader(&mut slice) {
+            Ok(h) => h,
+            Err(e) => {
+                result.errors.push((chain, format!("read error: {e}")));
+                return;
+            }
+        };
+        result.entries.push(ArchiveEntry {
+            container_chain: chain.clone(),
+            filename,
+            extension,
+            size_bytes: bytes.len() as i64,
+            content_hash,
+        });
+        if depth >= limits.max_depth {
+            result.errors.push((
+                chain,
+                format!("max archive depth exceeded ({} levels)", limits.max_depth),
+            ));
+            return;
+        }
+        // This buffer stays alive for the whole nested scan, so charge it to the shared budget
+        // for exactly that long and release it once the recursion (and the Vec) is done.
+        let held = bytes.len() as u64;
+        *budget -= held;
+        scan_level(
+            std::io::Cursor::new(bytes),
+            &chain,
+            depth + 1,
+            limits,
+            budget,
+            result,
+        );
+        *budget += held;
+    } else {
+        // Leaf file: stream-hash with an actual-byte cap (declared size may lie); record the TRUE length.
+        // `u64::MAX` when unlimited: `hash_capped` still counts real bytes, so a lying header
+        // cannot escape -- there is simply no ceiling to trip.
+        let cap = limits.entry_max_bytes.unwrap_or(u64::MAX);
+        match hash_capped(&mut entry, cap) {
+            Ok((content_hash, actual)) => {
+                result.entries.push(ArchiveEntry {
+                    container_chain: chain,
+                    filename,
+                    extension,
+                    size_bytes: actual as i64,
+                    content_hash,
+                });
+            }
+            Err(reason) => {
+                result.errors.push((chain, reason));
+            }
+        }
+    }
+}
+
+/// Scan one zip-format level: `reader` is already known (by `scan_level`) to be a zip.
+fn scan_zip_level<R: Read + Seek>(
     reader: R,
     chain_prefix: &str,
     depth: usize,
@@ -309,104 +492,110 @@ fn scan_level<R: Read + Seek>(
         let filename = name.rsplit('/').next().unwrap_or(&name).to_string();
         let extension = entry_extension(&name);
 
-        let (head, is_zip) = match peek4(&mut entry) {
+        let (head, is_zip, is_7z) = match peek6(&mut entry) {
             Ok(v) => v,
             Err(e) => {
                 result.errors.push((chain, format!("read error: {e}")));
                 continue;
             }
         };
-        // Chain the peeked bytes back in front, so both branches below see the entire entry.
-        let mut entry = std::io::Cursor::new(head).chain(entry);
+        handle_entry(
+            chain,
+            filename,
+            extension,
+            head,
+            is_zip || is_7z,
+            entry,
+            depth,
+            limits,
+            budget,
+            result,
+        );
+    }
+}
 
-        if is_zip {
-            // Nested archive: buffer it (bounded) so we can BOTH hash it and re-open it with Seek
-            // to recurse. Only archives are buffered — large leaf files stream (see else branch).
-            // Cap this buffer by whatever the whole descent has left, not just the per-entry limit.
-            let cap = limits.buffer_max_bytes.min(*budget);
-            if cap == 0 {
-                result.errors.push((
-                    chain,
-                    format!(
-                        "nested-archive buffer budget exhausted ({} bytes total)",
-                        limits.total_buffer_bytes
-                    ),
-                ));
-                continue;
-            }
-            let bytes = match read_capped(&mut entry, cap) {
-                Ok(b) => b,
-                Err(reason) => {
-                    // Budget pressure from legitimate ancestors is not a bomb; saying so would
-                    // send the user hunting for a hostile file that does not exist.
-                    let reason = if cap < limits.buffer_max_bytes {
-                        format!(
-                            "nested archive skipped: only {cap} of the {} byte buffer budget \
-                             remained (ancestor archives hold the rest)",
-                            limits.total_buffer_bytes
-                        )
-                    } else {
-                        reason
-                    };
-                    result.errors.push((chain, reason));
-                    continue;
-                }
-            };
-            let mut slice: &[u8] = &bytes;
-            let content_hash = match hashing::hash_reader(&mut slice) {
-                Ok(h) => h,
-                Err(e) => {
-                    result.errors.push((chain, format!("read error: {e}")));
-                    continue;
-                }
-            };
-            result.entries.push(ArchiveEntry {
-                container_chain: chain.clone(),
-                filename,
-                extension,
-                size_bytes: bytes.len() as i64,
-                content_hash,
-            });
-            if depth >= limits.max_depth {
-                result.errors.push((
-                    chain,
-                    format!("max archive depth exceeded ({} levels)", limits.max_depth),
-                ));
-                continue;
-            }
-            // This buffer stays alive for the whole nested scan, so charge it to the shared budget
-            // for exactly that long and release it once the recursion (and the Vec) is done.
-            let held = bytes.len() as u64;
-            *budget -= held;
-            scan_level(
-                std::io::Cursor::new(bytes),
-                &chain,
-                depth + 1,
-                limits,
-                budget,
-                result,
-            );
-            *budget += held;
-        } else {
-            // Leaf file: stream-hash with an actual-byte cap (declared size may lie); record the TRUE length.
-            // `u64::MAX` when unlimited: `hash_capped` still counts real bytes, so a lying header
-            // cannot escape -- there is simply no ceiling to trip.
-            let cap = limits.entry_max_bytes.unwrap_or(u64::MAX);
-            match hash_capped(&mut entry, cap) {
-                Ok((content_hash, actual)) => {
-                    result.entries.push(ArchiveEntry {
-                        container_chain: chain,
-                        filename,
-                        extension,
-                        size_bytes: actual as i64,
-                        content_hash,
-                    });
-                }
-                Err(reason) => {
-                    result.errors.push((chain, reason));
-                }
-            }
+/// Scan one 7z-format level: `reader` is already known (by `scan_level`) to be a 7z.
+///
+/// `sevenz_rust2::SevenZReader::for_each_entries` hands each entry to a closure as a live,
+/// streaming `&mut dyn Read` (decoded lazily, chunk by chunk, as the closure reads it) -- exactly
+/// what `handle_entry`'s leaf path needs to stream-hash in bounded memory, and what its
+/// nested-archive path needs to buffer under the shared budget.
+fn scan_7z_level<R: Read + Seek>(
+    reader: R,
+    chain_prefix: &str,
+    depth: usize,
+    limits: &ArchiveLimits,
+    budget: &mut u64,
+    result: &mut ArchiveScanResult,
+) {
+    let mut archive = match sevenz_rust2::SevenZReader::new(reader, sevenz_rust2::Password::empty())
+    {
+        Ok(a) => a,
+        Err(e) => {
+            result.errors.push((
+                chain_prefix.to_string(),
+                format!("unreadable 7z archive: {e}"),
+            ));
+            return;
         }
+    };
+
+    let outcome = archive.for_each_entries(|entry, r| {
+        if entry.is_directory {
+            return Ok(true);
+        }
+        let name = entry.name.clone();
+        let chain = join_chain(chain_prefix, &name);
+        let filename = name.rsplit('/').next().unwrap_or(&name).to_string();
+        let extension = entry_extension(&name);
+
+        // Unlike the zip path above, there is no ratio pre-filter here. 7z declares a real
+        // per-entry uncompressed size, but NOT a reliable per-entry compressed size: solid
+        // compression packs many files into one shared folder, and this crate only fills in
+        // `compressed_size` for the first file of each folder (0 for the rest). A ratio computed
+        // from that would be wrong for nearly every entry in an ordinary multi-file .7z. So the
+        // real guard here is `entry_max_bytes`, enforced on the actual decompressed byte count as
+        // it streams through `handle_entry`'s leaf path below -- the same protection `hash_capped`
+        // already gives every format against a header that lies about its size. See `ratio_cap`'s
+        // doc comment on `ArchiveLimits` for what this means in practice: a pathological 7z entry
+        // can stream all the way up to `entry_max_bytes` before being rejected.
+        //
+        // A coarser guard WAS available and was deliberately not taken: `sevenz_rust2::Archive`
+        // (lower-level than the `SevenZReader::for_each_entries` streaming API used here) exposes
+        // `folders`, `pack_sizes`, `is_solid`, and a `stream_map`, from which a FOLDER-level ratio
+        // (total pack size vs. total unpack size of the folder an entry belongs to) could be
+        // precomputed before decoding. That would catch a bomb one solid-compression block at a
+        // time rather than per file. It was not built here because it means walking a second, lower-
+        // level API alongside the streaming one just for this pre-check, trading away the shared
+        // `handle_entry` path's simplicity for a coarser guard, for a format currently worth 5 files
+        // and ~400 MB of the user's own (non-adversarial) data. If 7z's threat model changes -- more
+        // files, an untrusted source -- this is the route to tighten it.
+        let (head, is_zip, is_7z) = match peek6(r) {
+            Ok(v) => v,
+            Err(e) => {
+                result.errors.push((chain, format!("read error: {e}")));
+                return Ok(true);
+            }
+        };
+        handle_entry(
+            chain,
+            filename,
+            extension,
+            head,
+            is_zip || is_7z,
+            r,
+            depth,
+            limits,
+            budget,
+            result,
+        );
+        Ok(true)
+    });
+    if let Err(e) = outcome {
+        result.errors.push((
+            chain_prefix.to_string(),
+            format!("7z archive read error: {e}"),
+        ));
     }
 }
 
@@ -423,6 +612,11 @@ mod tests {
             .collect();
         let allow: Vec<String> = vec![];
         assert_eq!(descent_for("zip", &deny, &allow), Descent::Descend);
+        assert_eq!(
+            descent_for("7z", &deny, &allow),
+            Descent::Descend,
+            "7z is natively descended, same as zip -- no allow-list entry required"
+        );
         assert_eq!(
             descent_for("docx", &deny, &allow),
             Descent::Leaf,
@@ -453,6 +647,14 @@ mod tests {
         let allow: Vec<String> = vec!["bak".into()];
         assert_eq!(descent_for("zip", &deny, &allow), Descent::Leaf);
         assert_eq!(descent_for("bak", &deny, &allow), Descent::Leaf);
+    }
+
+    #[test]
+    fn a_user_who_denies_7z_is_obeyed_even_though_it_is_native() {
+        // 7z is descended by default same as zip, with no allow-list entry needed -- but that
+        // default must still be a user-editable choice, not baked in unconditionally.
+        let deny: Vec<String> = vec!["7z".into()];
+        assert_eq!(descent_for("7z", &deny, &[]), Descent::Leaf);
     }
 
     #[test]
@@ -904,6 +1106,82 @@ mod tests {
         let mut z = zip::ZipArchive::new(Cursor::new(top.to_vec())).unwrap();
         let n = z.by_name("level2.zip").unwrap().size();
         n
+    }
+
+    /// Build an in-memory 7z (Vec of (name, bytes)), same shape as `make_zip` above.
+    fn write_7z(path: &std::path::Path, files: &[(&str, &[u8])]) {
+        let mut sz = sevenz_rust2::SevenZWriter::create(path).unwrap();
+        for (name, bytes) in files {
+            sz.push_archive_entry(
+                sevenz_rust2::SevenZArchiveEntry::new_file(name),
+                Some(*bytes),
+            )
+            .unwrap();
+        }
+        sz.finish().unwrap();
+    }
+
+    #[test]
+    fn a_7z_signature_is_recognised_regardless_of_extension() {
+        assert!(looks_like_7z(&[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0, 0]));
+        assert!(!looks_like_7z(b"PK\x03\x04"));
+    }
+
+    #[test]
+    fn scanning_a_7z_hashes_its_entries_like_any_other_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bundle.7z");
+        write_7z(&path, &[("a.txt", b"AAA"), ("sub/b.txt", b"BBB")]);
+
+        let f = std::fs::File::open(&path).unwrap();
+        let out = scan_archive(std::io::BufReader::new(f), &limits());
+
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let mut chains: Vec<&str> = out
+            .entries
+            .iter()
+            .map(|e| e.container_chain.as_str())
+            .collect();
+        chains.sort();
+        assert_eq!(chains, vec!["a.txt", "sub/b.txt"]);
+        let a = out
+            .entries
+            .iter()
+            .find(|e| e.container_chain == "a.txt")
+            .unwrap();
+        assert_eq!(a.content_hash, blake3::hash(b"AAA").to_hex().to_string());
+        assert_eq!(a.size_bytes, 3);
+    }
+
+    /// Directed test for the finding in the Task 10 review: with no ratio-cap pre-filter for 7z,
+    /// `entry_max_bytes` is the SOLE guard against a pathological entry, so it must be proven
+    /// against the real `sevenz_rust2` streaming decoder rather than inferred from the zip test of
+    /// the same shape (`rejects_oversized_entry` above). Mirrors that test's structure exactly.
+    #[test]
+    fn rejects_an_oversized_7z_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("big.7z");
+        write_7z(&path, &[("big.bin", b"0123456789")]);
+        let small = ArchiveLimits {
+            entry_max_bytes: Some(4),
+            ..limits()
+        };
+
+        let f = std::fs::File::open(&path).unwrap();
+        let res = scan_archive(std::io::BufReader::new(f), &small);
+
+        assert!(
+            res.entries.is_empty(),
+            "must not be catalogued: {:?}",
+            res.entries
+        );
+        assert_eq!(res.errors.len(), 1);
+        assert!(
+            res.errors[0].1.contains("zip bomb"),
+            "entry_max_bytes must actually trip against the real decoded stream, not a declared \
+             size: reason was {:?}",
+            res.errors[0].1
+        );
     }
 
     #[test]

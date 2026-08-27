@@ -438,14 +438,22 @@ pub fn scan_volume_with_progress(
         // central directory from the END of the file, not the start). The extension is used as a
         // HINT to do that extra tail read, never as the decision: `._Video.zip` (AppleDouble) also
         // reaches the tail check, finds no EOCD signature, and is correctly left a leaf.
+        //
+        // 7z has no such prefixed/self-extracting variant to worry about here: its signature is
+        // always the first six bytes, so the head check alone is enough and there is no equivalent
+        // tail fallback to gate on an extension hint.
         let is_archive = {
             let ext_looks_like_zip = path
                 .extension()
                 .map(|e| e.eq_ignore_ascii_case("zip"))
                 .unwrap_or(false);
+            let ext_looks_like_7z = path
+                .extension()
+                .map(|e| e.eq_ignore_ascii_case("7z"))
+                .unwrap_or(false);
             let detected = open_for_archive_detection(path).and_then(|mut f| {
-                let (_head, head_is_zip) = archive::peek4(&mut f)?;
-                if head_is_zip {
+                let (_head, head_is_zip, head_is_7z) = archive::peek6(&mut f)?;
+                if head_is_zip || head_is_7z {
                     return Ok(true);
                 }
                 if ext_looks_like_zip {
@@ -479,7 +487,7 @@ pub fn scan_volume_with_progress(
                     // new file we could not open) does the extension remain the last resort.
                     match prior_meta {
                         Some((_, _, has_archive_entries, _)) => has_archive_entries,
-                        None => ext_looks_like_zip,
+                        None => ext_looks_like_zip || ext_looks_like_7z,
                     }
                 }
             }

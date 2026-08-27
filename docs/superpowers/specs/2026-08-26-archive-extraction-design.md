@@ -1,6 +1,6 @@
 # Archive extraction — design
 
-**Status:** proposed
+**Status:** accepted, implemented in #77
 **Date:** 2026-08-26
 **Supersedes the verdict in:** #72 (*"costs more space than it recovers"* — no longer true; see below)
 **Related:** #19 (cross-drive scratch for repack), #27 (review at scale)
@@ -55,12 +55,12 @@ attempt them and must not silently try.
 | Free space | **Preflight before each archive; refuse rather than fill the drive** | Requires `uncompressed_size + 5 GiB` free. Refusing an item is recoverable; filling a drive holding irreplaceable data is not |
 | Verification | **Re-hash every extracted file against the entry hash already in the catalogue, before the original is quarantined** | The catalogue already holds a BLAKE3 for every entry. Extraction that cannot be proven correct must not be followed by removing the only other copy |
 | Failure | **Delete the partial extraction, leave the archive untouched** | The archive is the source of truth until the extraction is proven. A failed attempt must leave the drive exactly as it was |
-| Original archive | **Quarantined to `_ToDelete`, never deleted** | The project's standing rule. It is also the second recovery net if verification was somehow wrong |
+| Original archive | **Quarantined to `_ToDelete`, never deleted**, via a dedicated `quarantine::quarantine_extracted_archive`, not `quarantine_files` | The project's standing rule. But `quarantine_files`'s last-copy guard refuses every extracted archive on sight — that guard was written for duplicate *files* ("is there another copy?"), and an archive's own bytes are unique by definition, so it always answers no. The dedicated path keeps the marker gate, the loose/active check, the collision-free destination, the rename-only rule and the action log, and replaces the last-copy guard with a stronger precondition: **no active row may still claim to live inside the archive** (`Catalog::archive_entries` on it returns empty). That is direct evidence step 9a's conversion committed, not just that a copy exists elsewhere |
 | Catalogue update | **Convert each entry row in place** (`relative_path` := extracted path, `container_chain` := NULL) | Preserves `id`, `content_hash` and `first_seen_at`, so history survives and no rescan is needed to make the extracted files reviewable. Deleting and re-inserting would orphan every reference |
 | Collision | **Refuse the archive if the destination folder already exists** | `idx_files_loose_identity` is unique on `(volume_id, relative_path)` for loose rows. Merging into an existing folder risks overwriting a file that is not a copy |
 | Nesting | **Recurse until no archive remains**, bounded by `max_archive_depth` (currently 8) | The user's choice. The catalogue holds archives 5 deep. The path-budget check already accounts for the fully-recursive layout, because `container_chain` describes it |
 | Worker | **A third job kind on the existing serial quarantine worker** | Extraction ends by quarantining the original and by rewriting catalogue rows. Running it beside the quarantine worker would put two writers in a race that each job's pre-move `active` check cannot survive |
-| `.7z` | **Scanner descent *and* extraction, via `sevenz-rust`** | User's explicit choice, made knowing the payoff is ~400 MB across 5 files. Descent must land first: extraction verifies against catalogued entry hashes, and today **zero** `.7z` contents are catalogued |
+| `.7z` | **Scanner descent *and* extraction, via `sevenz-rust2` 0.10** | User's explicit choice, made knowing the payoff is ~400 MB across 5 files. Descent must land first: extraction verifies against catalogued entry hashes, and today **zero** `.7z` contents are catalogued. `sevenz-rust2` replaces the spec's original `sevenz-rust` 0.6.1, whose last release was 2023; **0.22** was tried too and rejected — it requires rustc 1.93, above this project's declared MSRV of 1.82. 0.10 is the newest version that still builds under 1.82 |
 | Deny list | **Reused unchanged** from `config::DEFAULT_DENY` + `settings.json` | `docx`, `xlsx`, `jar`, `apk`, `epub`, `ipa` and the rest are zip-format *documents*. Exploding one destroys it. That list already exists and is user-editable on the Scan page |
 
 ## Architecture
@@ -106,7 +106,13 @@ Each numbered step must complete before the next begins. The archive is untouche
    `quarantine::quarantine_files`, so the marker check, rename-only rule and action log all apply
    unchanged.
 10. **Recurse.** Any extracted file that is itself an in-scope archive is enqueued as a new
-    `Job::Extract`, up to `max_archive_depth`.
+    `Job::Extract`, up to `max_archive_depth`. The rows beneath it are not left dangling at a path
+    that just moved to `_ToDelete`: each is **re-pointed** at the extracted inner archive —
+    `relative_path` becomes `<dest>/<inner-archive-file>` and `container_chain` becomes the old
+    chain minus its first segment. A nested archive therefore has no catalogued hash of its own to
+    check on the next pass, so it is verified **through its contents**: `verify_destination`
+    descends into it with the scanner's own reader and compares the chains found inside against
+    what the catalogue expects, exactly as the scanner would.
 
 Step 7 is the one that makes step 9 safe. Without it, quarantining the original removes the only
 proven copy of the content.
@@ -128,6 +134,20 @@ forbids.
 The honest accounting: this is a new dependency and a second format path through the scanner, for
 5 files totalling ~400 MB. It is being built because it was asked for, not because the arithmetic
 justifies it.
+
+**`ratio_cap` does not apply to `.7z`.** It is a zip-only guard: zip declares a reliable per-entry
+compressed size, so `uncompressed / compressed` catches a bomb before a byte is decoded. 7z's
+solid compression only fills in `compressed_size` for the first file of each shared folder — every
+other entry reads back 0 — so a ratio computed from it would be wrong for nearly every entry in an
+ordinary multi-file `.7z`. For `.7z`, `entry_max_bytes` is therefore the **sole** guard: a
+pathological entry can stream and decompress all the way up to that ceiling (64 GiB by default)
+before being rejected, where a comparable zip bomb would have been caught by the ratio check first.
+A coarser, folder-level precheck exists as a route if this ever needs tightening: the lower-level
+`sevenz_rust2::Archive` API (below the streaming `SevenZReader::for_each_entries` used here)
+exposes `folders`, `pack_sizes`, `is_solid` and a `stream_map`, from which a per-folder ratio
+(total pack size vs. total unpack size of the solid block an entry belongs to) could be
+precomputed before decoding. Not built here — it means walking a second, lower-level API alongside
+the streaming one for this one pre-check, which was not judged worth it for 5 files / ~400 MB.
 
 ## Error handling
 

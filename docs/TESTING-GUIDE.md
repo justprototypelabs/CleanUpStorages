@@ -214,7 +214,50 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 ---
 
-## 6. Reliability spot-checks (optional)
+## 6. Extract an archive (unlock archived duplicates)
+
+`bundle.zip` on DriveA holds `keep.txt` and `report.txt` — and `report.txt` is one of the 4-copy
+duplicate group, but locked: quarantine can't touch an entry inside a zip, only a loose file. This
+is what extraction is for.
+
+```powershell
+cus browse
+```
+
+Open the **Extract** page from the sidebar.
+
+- **Expect:** `bundle.zip` and `nested.zip` are both listed, each showing entry counts and a scope
+  verdict (in scope / out of scope, based on whether every extracted path would fit under 260
+  characters on this drive).
+- Click **Extract** on `bundle.zip`. It queues immediately and runs in the background — the row
+  shows queued → running → done without blocking the page.
+
+✅ **Expect**, once it finishes:
+
+```powershell
+Get-ChildItem "$env:USERPROFILE\Documents\cleanup-sandbox\DriveA\bundle"
+# -> keep.txt, report.txt
+Get-ChildItem "$env:USERPROFILE\Documents\cleanup-sandbox\DriveA\_ToDelete"
+# -> bundle.zip (the original, quarantined, never deleted)
+```
+
+`DriveA\bundle.zip` itself is gone from its old spot (moved, not deleted) and `DriveA\bundle\` now
+holds its contents as ordinary loose files.
+
+Go to the **Duplicates** page and find the report group again: the entry that used to read
+`bundle.zip › report.txt` with a **Remove from archive** action now shows as a plain loose file
+(`bundle/report.txt`) with the ordinary **Remove?** quarantine action — extraction unlocked it, so
+it no longer needs a repack to reclaim.
+
+Try `nested.zip` too, if you want to see recursion: it contains `inner.zip`, which contains
+`deep.txt`. Extracting `nested.zip` unlocks `inner.zip` as a loose file, which is itself an in-scope
+archive — the queue enqueues it automatically, and it extracts in turn without you clicking
+anything a second time. End state: `DriveA\nested\inner\deep.txt` on disk, and **two** archives
+(`nested.zip` and `nested/inner.zip`) both sitting in `_ToDelete`.
+
+---
+
+## 7. Reliability spot-checks (optional)
 
 - **Rename recognition:** rename `DriveA` to `DriveA-moved` in Explorer, then
   `cus scan "...\DriveA-moved"` — the tool reads the hidden marker and knows it's the **same volume** (not a new
@@ -226,7 +269,7 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 ---
 
-## 7. Observability (see the UI↔API connection)
+## 8. Observability (see the UI↔API connection)
 
 ```powershell
 $env:RUST_LOG = "info"
@@ -245,7 +288,7 @@ Reset it with `Remove-Item Env:RUST_LOG` when done.
 
 ---
 
-## 8. Clean up
+## 9. Clean up
 
 Everything was disposable. To remove all trace:
 
@@ -281,7 +324,8 @@ That deletes the test files, the isolated catalog, and its snapshots. Your real 
 | Purge (reclaim space) | §4 | |
 | Repack an in-zip duplicate (Case 4) | §3, §5 | |
 | Cross-drive / archived duplicate detection | §2 (4-copy group) | |
-| Volume re-recognition after rename | §6 | |
-| Missing-file tracking | §6 | |
-| Catalog snapshots / integrity guard | §1, §6 | |
-| Request logging + tracing | §7 | |
+| Extract an archive, incl. nested recursion | §6 | |
+| Volume re-recognition after rename | §7 | |
+| Missing-file tracking | §7 | |
+| Catalog snapshots / integrity guard | §1, §7 | |
+| Request logging + tracing | §8 | |
