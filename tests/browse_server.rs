@@ -116,6 +116,17 @@ fn archives_endpoint_reports_scope_and_refuses_to_guess_for_an_offline_drive() {
         body.contains("\"connected\":false"),
         "offline drive must say so: {body}"
     );
+    // Must be the literal null, not a defaulted false -- a regression that serialized "no verdict"
+    // as false would be indistinguishable from a real refusal, which is the exact bug the nullable
+    // field exists to prevent.
+    assert!(
+        body.contains("\"in_scope\":null"),
+        "offline drive must issue no verdict at all: {body}"
+    );
+    assert!(
+        !body.contains("\"in_scope\":false"),
+        "no verdict may be issued without a live mount: {body}"
+    );
     assert!(
         !body.contains("\"in_scope\":true"),
         "no verdict may be issued without a live mount: {body}"
@@ -131,7 +142,7 @@ fn extract_endpoint_requires_csrf_token() {
         r#"{"volume_id":"vol-1","paths":["archives/bundle.zip"]}"#,
     );
     assert!(
-        body.contains("403"),
+        body.contains("403 Forbidden"),
         "a request without the CSRF token must be rejected before touching the queue: {body}"
     );
 }

@@ -120,11 +120,41 @@ pub const SPACE_HEADROOM_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 /// Every reason an archive can be refused, checked before anything is written. Ordered cheapest
 /// first, and deliberately shared by the Extract page and the worker so the page cannot promise
 /// something the worker will refuse.
+///
+/// Thin wrapper over [`scope_check_with_space`] that measures free space itself. Callers checking
+/// a single archive against a mount want this; callers checking many archives against the SAME
+/// mount in one pass (e.g. the archives-list page) should call `scope_check_with_space` directly
+/// with one shared measurement -- see its doc comment for why.
 pub fn scope_check(
     cat: &Catalog,
     mount_root: &Path,
     volume_id: &str,
     archive_rel: &str,
+) -> anyhow::Result<Scope> {
+    let free = crate::repack::available_space(mount_root);
+    scope_check_with_space(cat, mount_root, volume_id, archive_rel, free)
+}
+
+/// Same check as [`scope_check`], but takes the mount's free space as a parameter instead of
+/// measuring it.
+///
+/// `free_bytes` is a parameter, not an internal call to `repack::available_space`, because that
+/// function does a full OS-level disk-list refresh (`sysinfo::Disks::new_with_refreshed_list()`)
+/// on every call -- not a cached lookup or a single free-space syscall. A caller checking many
+/// archives against one volume (the archives-list page, at the user's real catalogue: up to 1,806
+/// archives in one request) must measure free space ONCE per volume and pass it to every
+/// per-archive check, or the page blocks for as many full disk enumerations as it has archives.
+/// Do not "simplify" this back to calling `available_space` in here -- that reintroduces the
+/// per-archive re-enumeration this parameter exists to avoid.
+///
+/// `None` keeps `scope_check`'s existing meaning: free space could not be determined, so refuse
+/// rather than guess.
+pub fn scope_check_with_space(
+    cat: &Catalog,
+    mount_root: &Path,
+    volume_id: &str,
+    archive_rel: &str,
+    free_bytes: Option<u64>,
 ) -> anyhow::Result<Scope> {
     let entries = cat.archive_entries(volume_id, archive_rel)?;
     if entries.is_empty() {
@@ -159,7 +189,7 @@ pub fn scope_check(
 
     let uncompressed: i64 = entries.iter().map(|e| e.size_bytes).sum();
     let required = uncompressed as u64 + SPACE_HEADROOM_BYTES;
-    match crate::repack::available_space(mount_root) {
+    match free_bytes {
         Some(free) if free < required => {
             return Ok(Scope::Refused(format!(
                 "needs {required} bytes free (content {uncompressed} + 5 GiB headroom), {free} available"

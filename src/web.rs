@@ -1059,13 +1059,24 @@ async fn api_archives(
     let mut out = Vec::new();
     for (volume_id, _label, _active_files, _active_bytes) in cat.volume_stats().map_err(err500)? {
         let mount = mounts.get(&volume_id);
+        // Measured once per volume, not once per archive: `available_space` does a full
+        // OS-level disk-list enumeration, and the real catalogue can have up to 1,806 archives
+        // in one request. Re-enumerating per archive turned one page load into that many
+        // sequential disk scans.
+        let free_bytes = mount.and_then(|m| crate::repack::available_space(m));
         let mut archives = Vec::new();
         for root in cat.archive_roots(&volume_id).map_err(err500)? {
             let (in_scope, reason) = match mount {
                 None => (None, None),
                 Some(m) => {
-                    match crate::extract::scope_check(&cat, m, &volume_id, &root.relative_path)
-                        .map_err(err500)?
+                    match crate::extract::scope_check_with_space(
+                        &cat,
+                        m,
+                        &volume_id,
+                        &root.relative_path,
+                        free_bytes,
+                    )
+                    .map_err(err500)?
                     {
                         crate::extract::Scope::InScope { .. } => (Some(true), None),
                         crate::extract::Scope::Refused(r) => (Some(false), Some(r)),
