@@ -72,6 +72,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/tree-duplicates", get(api_tree_duplicates))
         .route("/api/duplicate-clusters", get(api_duplicate_clusters))
         .route("/api/quarantine-tree", post(api_quarantine_tree))
+        .route("/api/quarantine-cluster", post(api_quarantine_cluster))
         .route("/api/quarantine/status", get(api_quarantine_status))
         .route("/api/copies", get(api_copies))
         .route("/api/volumes/:id/errors", get(api_volume_errors))
@@ -981,6 +982,89 @@ async fn api_quarantine(
         }
     }
 
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+struct QuarantineClusterReq {
+    cluster_id: String,
+    /// The review floor the client rendered the cluster with. Resolving with a different floor
+    /// would act on groups whose blast radius the user was never shown.
+    min_size: Option<i64>,
+    #[serde(default)]
+    preference: Vec<crate::catalog::clusters::ClusterDir>,
+}
+
+#[derive(Serialize, Default)]
+struct QuarantineClusterDto {
+    queued: usize,
+    skipped: usize,
+    /// Copies inside archives. Reported so the user knows what the confirm could not reach; a zip
+    /// entry needs a repack or an extraction, not a rename.
+    archived_skipped: i64,
+    position: usize,
+    unmounted_volumes: Vec<String>,
+}
+
+/// Confirm one cluster: resolve the user's directory ranking into ids and enqueue them (#78).
+///
+/// The confirm only ENQUEUES. Every file still goes through the worker's disk-aware last-copy
+/// guard one at a time, so a cluster decision can never bypass a safety check.
+async fn api_quarantine_cluster(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Json<QuarantineClusterReq>,
+) -> Result<Json<QuarantineClusterDto>, (StatusCode, String)> {
+    check_csrf(&headers, &state)?;
+    use crate::catalog::clusters::ClusterResolveError as E;
+
+    let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
+    let min_size = body
+        .min_size
+        .unwrap_or(crate::catalog::dedup::DEFAULT_MIN_SIZE)
+        .max(0);
+    let plan = cat
+        .cluster_victims(&body.cluster_id, min_size, &body.preference)
+        .map_err(|e| match e {
+            // 409, not 404: the request was well-formed, the world moved. The client reloads.
+            E::NoSuchCluster => (StatusCode::CONFLICT, e.to_string()),
+            E::UnknownDirectory(_) => (StatusCode::BAD_REQUEST, e.to_string()),
+            E::NotKeepable => (StatusCode::CONFLICT, e.to_string()),
+            E::Db(_) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        })?;
+
+    let mut out = QuarantineClusterDto {
+        archived_skipped: plan.archived_skipped,
+        ..Default::default()
+    };
+    let mut by_volume: std::collections::HashMap<String, Vec<i64>> =
+        std::collections::HashMap::new();
+    for id in plan.victims {
+        match cat.get_file(id).map_err(err500)? {
+            Some(rec) => by_volume.entry(rec.volume_id).or_default().push(id),
+            None => out.skipped += 1,
+        }
+    }
+    let mounts = state.mounts.snapshot();
+    for (volume_id, ids) in by_volume {
+        // A cluster spanning a connected and a disconnected drive still does the half it can, the
+        // way `api_quarantine` does: the unreachable volume is named rather than failing the whole
+        // decision the user just made.
+        if !mounts.contains_key(&volume_id) {
+            out.skipped += ids.len();
+            out.unmounted_volumes.push(volume_id);
+            continue;
+        }
+        let n = ids.len();
+        match state.quarantine_queue.enqueue_files(volume_id, ids) {
+            Some(position) => {
+                out.queued += n;
+                out.position = position;
+            }
+            // Already queued: the reviewer double-clicked, and the decision is on its way.
+            None => out.skipped += n,
+        }
+    }
     Ok(Json(out))
 }
 
