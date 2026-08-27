@@ -1459,11 +1459,16 @@ async function poll(){
   const parts=[];
   if(busy) parts.push('<b>'+(running?'Extracting '+esc(running.label):'Queued')+'</b>'
     +(pending.length?' — '+pending.length+' more queued':''));
-  if(recentExtracts.length) parts.push('<ul style="margin:6px 0 0;padding-left:18px">'+recentExtracts.map(r=>
-    r.error_message
-      ? `<li style="color:var(--red)">${esc(r.label)}: ${esc(r.error_message)}</li>`
-      : `<li>${esc(r.label)}: ${fmtN(r.files_updated)} entries verified → ${esc(r.dest||'')}</li>`
-  ).join('')+'</ul>');
+  if(recentExtracts.length) parts.push('<ul style="margin:6px 0 0;padding-left:18px">'+recentExtracts.map(r=>{
+    if(r.error_message) return `<li style="color:var(--red)">${esc(r.label)}: ${esc(r.error_message)}</li>`;
+    // r.skipped==1 means the extraction and verification fully succeeded but the ORIGINAL archive
+    // could not be quarantined (ExtractOutcome.quarantined==false) -- everything except the final
+    // rename happened. That is not a clean success: the archive is still on the drive, still
+    // consuming the space this extraction was meant to reclaim, and there is no automatic retry.
+    // Must be visibly distinct from the success line below, not folded into it.
+    if(r.skipped) return `<li style="color:var(--amber)">${esc(r.label)}: ${fmtN(r.files_updated)} entries verified → ${esc(r.dest||'')}, but the original archive could NOT be moved to quarantine — it is still on the drive and must be moved by hand</li>`;
+    return `<li>${esc(r.label)}: ${fmtN(r.files_updated)} entries verified → ${esc(r.dest||'')}</li>`;
+  }).join('')+'</ul>');
   $("#queue").innerHTML=parts.join('');
   $("#queue").hidden=parts.length===0;
   // The verdict and the row's own Extract button go stale the moment its archive is done -- reload
