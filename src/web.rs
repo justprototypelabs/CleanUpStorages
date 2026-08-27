@@ -2059,7 +2059,7 @@ mod tests {
 
     #[test]
     fn extract_conflict_for_scan_names_every_conflicting_job() {
-        let jobs = vec![
+        let jobs = [
             crate::quarantine_queue::QuarantineJobDto {
                 kind: "extract".into(),
                 volume_id: "vol-1".into(),
