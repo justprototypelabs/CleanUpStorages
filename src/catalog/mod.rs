@@ -1,4 +1,5 @@
 pub mod backup;
+pub mod clusters;
 pub mod dedup;
 pub mod models;
 pub mod pending_formats;

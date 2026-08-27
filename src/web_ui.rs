@@ -923,6 +923,14 @@ pub fn review_page(csrf: &str) -> String {
   <div id="treelist"></div>
   <div id="treeblocked"></div>
   </section>
+  <section id="clustersec" style="display:none;margin-bottom:26px">
+    <h2 style="font-size:15px;margin:0 0 4px">Folders that overlap</h2>
+    <p class="mut" style="font-size:12px;margin:0 0 12px">Folders that share many duplicates without
+      matching exactly. Click the folders in the order you prefer them — for each duplicate the
+      highest-ranked folder that has a copy keeps it, and the others move to
+      <span class="mono">_ToDelete</span>. Nothing is deleted until you purge.</p>
+    <div id="clusterlist"></div>
+  </section>
   <div id="group"></div>
   <div class="mut" id="upnext" style="font-size:12px;margin-top:14px;text-align:center"></div>
   <div class="rvbar">
@@ -1031,7 +1039,7 @@ $("#confirm").addEventListener("click",async()=>{
 });
 $("#skip").addEventListener("click",()=>{ idx++; $("#msg").textContent=""; render(); });
 // A plain <select>: enhanceSelect is the Browse page's multi-select widget and the floor is one value.
-$("#minsize").addEventListener("change",()=>{ minSize=Number($("#minsize").value); $("#msg").textContent=""; load(); });
+$("#minsize").addEventListener("change",()=>{ minSize=Number($("#minsize").value); $("#msg").textContent=""; load(); loadClusters(); });
 
 // ---- Identical folders (#38) ----------------------------------------------------------------
 // Shown ABOVE the per-file list because it is the decision worth making first: on a real catalogue
@@ -1156,6 +1164,133 @@ async function confirmTree(group,member,btn){
   }
 }
 
+
+// ---- Overlapping folders (#78) ---------------------------------------------------------------
+// Ordered by reclaimable BYTES, never by decision count: the measurement behind this section found
+// the two anti-correlated -- count-ordering spends ~1,800 decisions on build output worth ~0.1 GiB
+// before it reaches the course folders worth ~23 GiB.
+let clusterOffset=0, clusterTotal=0, clusterFloor=0;
+async function loadClusters(more){
+  if(!more) clusterOffset=0;
+  clusterFloor=minSize;
+  let data; try{
+    data=await apiGet("/api/duplicate-clusters?limit=100&min_size="+clusterFloor+"&offset="+clusterOffset);
+  }catch(e){ return; }
+  clusterTotal=data.total;
+  const sec=$("#clustersec"), host=$("#clusterlist");
+  if(!data.clusters.length && !more){ sec.style.display="none"; return; }
+  sec.style.display="";
+  if(!more) host.textContent="";
+  clusterOffset += data.clusters.length;
+  for(const c of data.clusters) host.appendChild(clusterCard(c));
+  const old=document.getElementById("clustermore"); if(old) old.remove();
+  if(clusterOffset < clusterTotal){
+    const b=document.createElement("button");
+    b.id="clustermore"; b.className="linkbtn"; b.style.cssText="margin-top:12px;font-size:12.5px";
+    b.textContent="Load more ("+(clusterTotal-clusterOffset).toLocaleString()+" clusters left)";
+    b.addEventListener("click", async ()=>{ b.disabled=true; b.textContent="Loading...";
+      await loadClusters(true); });
+    host.parentNode.insertBefore(b, host.nextSibling);
+  }
+}
+
+function clusterCard(c){
+  const box=document.createElement("div");
+  box.className="card";
+  box.style.cssText="padding:12px 14px;margin-bottom:10px";
+  const head=document.createElement("div");
+  head.style.cssText="font-size:13px;margin-bottom:8px";
+  // Blast radius first: this is one click standing in for every group in the cluster.
+  head.innerHTML=`<strong>${fmtN(c.group_count)} duplicate groups</strong> <span class="mut">· ${
+    esc(fmtB(c.reclaimable_bytes))} reclaimable · ${esc(c.sample_names.join(", "))}</span>`;
+  box.appendChild(head);
+
+  const pref=[];               // ClusterDir objects, in the order the user clicked them
+  const ranks=new Map();       // dir key -> the span showing its position
+  const go=document.createElement("button");
+  for(const d of c.dirs){
+    const key=d.volume_id+"\u0000"+d.dir;
+    const row=document.createElement("div");
+    row.className="row";
+    row.style.cssText="justify-content:space-between;gap:12px;padding:4px 0;flex-wrap:wrap";
+    const label=document.createElement("span");
+    label.className="mono";
+    label.style.cssText="font-size:12px;word-break:break-all";
+    // The full path, always: folder names are not what matched, so the path is the only way to
+    // tell which copy is which.
+    label.textContent=d.volume_label+" / "+(d.dir||"(drive root)");
+    row.appendChild(label);
+    const rank=document.createElement("span");
+    rank.className="mut"; rank.style.fontSize="11.5px";
+    if(d.unreadable){
+      rank.textContent="the scan could not read this folder — cannot be kept";
+    }else if(!d.mounted){
+      rank.textContent="drive not connected";
+    }
+    row.appendChild(rank);
+    if(!d.unreadable){
+      const btn=document.createElement("button");
+      btn.className="linkbtn"; btn.style.fontSize="12.5px";
+      btn.textContent="Prefer this folder";
+      btn.addEventListener("click",()=>{
+        if(pref.some(p=>p.volume_id===d.volume_id&&p.dir===d.dir)) return;
+        pref.push({volume_id:d.volume_id,dir:d.dir});
+        for(const [k,el] of ranks){
+          const i=pref.findIndex(p=>k===p.volume_id+"\u0000"+p.dir);
+          if(i>=0) el.textContent = i===0 ? "keep first" : "then keep #"+(i+1);
+        }
+        go.disabled=false;
+      });
+      row.appendChild(btn);
+      ranks.set(key, rank);
+    }
+    box.appendChild(row);
+  }
+  if(c.archived_group_count){
+    const n=document.createElement("div");
+    n.className="mut"; n.style.cssText="font-size:11.5px;margin-top:6px";
+    n.textContent=fmtN(c.archived_group_count)+" of these also have a copy inside an archive — "
+      +"those need a repack, and are left alone.";
+    box.appendChild(n);
+  }
+  go.className="btn btn-primary";
+  go.style.cssText="margin-top:10px;font-size:12.5px";
+  go.textContent="Quarantine the rest";
+  go.disabled=true;
+  if(!c.keepable){
+    go.style.display="none";
+    const w=document.createElement("div");
+    w.className="mut"; w.style.cssText="font-size:11.5px;margin-top:6px";
+    w.textContent="Every folder here is one the scan could not read, so there is no verified copy "
+      +"to keep. Nothing can be confirmed for this cluster.";
+    box.appendChild(w);
+  }
+  go.addEventListener("click", async ()=>{
+    // The line breaks below MUST stay as the two-character escape \n. A real newline inside this
+    // string is a JavaScript syntax error, which kills the whole page script -- including the
+    // per-file duplicate list, which then silently renders nothing.
+    if(!confirm("Quarantine the redundant copies in "+fmtN(c.group_count)+" duplicate groups?\n\n"
+      +"Keeping, in this order:\n"
+      +pref.map((p,i)=>(i+1)+". "+p.dir).join("\n")
+      +"\n\n"+fmtB(c.reclaimable_bytes)+" reclaimable. Nothing is deleted until you purge.")) return;
+    go.disabled=true; go.textContent="Queued";
+    try{
+      const r=await apiPost("/api/quarantine-cluster",
+        {cluster_id:c.id, min_size:clusterFloor, preference:pref});
+      if(r.skipped) $("#msg").textContent=r.skipped+" copies were not queued (drive not connected, or already queued).";
+      pollQuarantine();
+    }catch(e){
+      // A refused confirm (stale cluster) lands here. Reload rather than retry: the list the user
+      // is looking at no longer describes the catalogue.
+      $("#msg").textContent="Could not queue: "+e.message;
+      go.disabled=false; go.textContent="Quarantine the rest";
+      loadClusters();
+    }
+  });
+  box.appendChild(go);
+  return box;
+}
+
 let qTimer=null, qWasBusy=false, qMaxSeqReported=-1;
 async function pollQuarantine(){
   if(qTimer) return;                       // one poller is enough
@@ -1194,13 +1329,14 @@ async function pollQuarantine(){
     if(skipped) m+=" "+skipped+" kept (not moved — see the action log).";
     if(failed.length) m+=" "+failed.length+" could not be quarantined — "+failed[0].error_message;
     if(m) $("#msg").textContent=m.trim();
-    if(qWasBusy && !busy){ clearInterval(qTimer); qTimer=null; await loadTrees(); }
+    if(qWasBusy && !busy){ clearInterval(qTimer); qTimer=null; await loadTrees(); await loadClusters(); }
     qWasBusy=busy;
   };
   await tick();
   qTimer=setInterval(tick, 1500);
 }
 loadTrees();
+loadClusters();
 pollQuarantine();
 load();"##;
     shell("duplicates", csrf, "Review duplicates", main, script)

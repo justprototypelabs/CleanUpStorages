@@ -143,3 +143,176 @@ fn review_duplicates_then_quarantine_over_http() {
     assert_eq!(remaining, 1);
     assert!(drive.join("_ToDelete").exists());
 }
+
+/// Seed a drive with two duplicate groups that both span `dirA` and `dirB` -- the partial-overlap
+/// shape identical-tree collapse cannot reach, since `dirA` also holds a file `dirB` does not.
+fn seed_cluster_drive() -> (std::path::PathBuf, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("c.db");
+    let drive = tmp.path().join("driveC");
+    std::fs::create_dir_all(drive.join("dirA")).unwrap();
+    std::fs::create_dir_all(drive.join("dirB")).unwrap();
+    std::fs::write(drive.join(".cleanupstorages_id"), "vol-1").unwrap();
+    std::fs::write(drive.join("dirA/a.txt"), b"SAME-CONTENT").unwrap();
+    std::fs::write(drive.join("dirB/a.txt"), b"SAME-CONTENT").unwrap();
+    std::fs::write(drive.join("dirA/b.txt"), b"OTHER-CONTENT").unwrap();
+    std::fs::write(drive.join("dirB/b.txt"), b"OTHER-CONTENT").unwrap();
+    // Only in dirA: this is what makes the two folders overlap rather than match.
+    std::fs::write(drive.join("dirA/only-here.txt"), b"UNIQUE").unwrap();
+    {
+        let cat = cleanupstorages::catalog::Catalog::open(&db).unwrap();
+        cat.upsert_volume(&cleanupstorages::catalog::models::Volume {
+            volume_id: "vol-1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+        let ident = cleanupstorages::volume::VolumeIdentity {
+            volume_id: "vol-1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+        };
+        cleanupstorages::scanner::scan_volume(&cat, &drive, &ident, false, 100, &test_limits())
+            .unwrap();
+    }
+    std::mem::forget(tmp);
+    (db, drive)
+}
+
+fn json_body(raw: &str) -> serde_json::Value {
+    let body = raw.split("\r\n\r\n").nth(1).unwrap_or("");
+    serde_json::from_str(body.trim()).unwrap()
+}
+
+fn post_json(addr: std::net::SocketAddr, path: &str, payload: &str) -> String {
+    req(
+        addr,
+        &format!(
+            "POST {path} HTTP/1.0\r\nHost: x\r\ncontent-type: application/json\r\nx-cleanup-token: TESTTOKEN\r\ncontent-length: {}\r\n\r\n{}",
+            payload.len(),
+            payload
+        ),
+    )
+}
+
+/// One ranking of two folders quarantines every redundant copy and keeps every preferred one.
+#[test]
+fn confirming_a_cluster_quarantines_the_victims_and_leaves_the_keepers() {
+    let (db, drive) = seed_cluster_drive();
+    let addr = start(db, drive.clone());
+
+    // min_size=0: the fixture's files are a few bytes, well under the 1 MiB review floor.
+    let list = req(
+        addr,
+        "GET /api/duplicate-clusters?min_size=0&limit=10&offset=0 HTTP/1.0\r\nHost: x\r\n\r\n",
+    );
+    assert!(list.contains("200 OK"), "list: {list}");
+    let list = json_body(&list);
+    assert_eq!(list["total"], 1, "both groups share the same folder pair");
+    let c = &list["clusters"][0];
+    assert_eq!(c["group_count"], 2);
+    assert_eq!(c["keepable"], true);
+    let cluster_id = c["id"].as_str().unwrap().to_string();
+
+    let payload = serde_json::json!({
+        "cluster_id": cluster_id,
+        "min_size": 0,
+        "preference": [{"volume_id": "vol-1", "dir": "dirA"}],
+    })
+    .to_string();
+    let resp = post_json(addr, "/api/quarantine-cluster", &payload);
+    assert!(resp.contains("200 OK"), "confirm: {resp}");
+    let resp = json_body(&resp);
+    assert_eq!(resp["queued"], 2, "the two dirB copies");
+    assert_eq!(resp["skipped"], 0);
+
+    // The request only enqueued; poll on the effect this test asserts rather than on `_ToDelete`,
+    // which exists microseconds before the first rename lands inside it.
+    let victims_left = || {
+        [
+            drive.join("dirB/a.txt").exists(),
+            drive.join("dirB/b.txt").exists(),
+        ]
+        .iter()
+        .filter(|x| **x)
+        .count()
+    };
+    let mut left = victims_left();
+    for _ in 0..400 {
+        left = victims_left();
+        if left == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert_eq!(left, 0, "every redundant copy moved");
+    assert!(drive.join("dirA/a.txt").exists(), "keepers stay put");
+    assert!(drive.join("dirA/b.txt").exists(), "keepers stay put");
+    assert!(drive.join("dirA/only-here.txt").exists());
+    assert!(drive.join("_ToDelete").exists());
+}
+
+/// A cluster id from a list loaded before the catalogue changed is refused, never reapplied to a
+/// membership the user did not see.
+#[test]
+fn a_stale_cluster_confirm_is_refused_and_moves_nothing() {
+    let (db, drive) = seed_cluster_drive();
+    let addr = start(db.clone(), drive.clone());
+
+    let list = json_body(&req(
+        addr,
+        "GET /api/duplicate-clusters?min_size=0&limit=10&offset=0 HTTP/1.0\r\nHost: x\r\n\r\n",
+    ));
+    let cluster_id = list["clusters"][0]["id"].as_str().unwrap().to_string();
+
+    // The catalogue moves on: something else already quarantined the dirB rows, so the {dirA,dirB}
+    // set no longer describes any group.
+    {
+        let cat = cleanupstorages::catalog::Catalog::open(&db).unwrap();
+        cat.conn
+            .execute(
+                "UPDATE files SET status='quarantined' WHERE relative_path LIKE 'dirB%'",
+                [],
+            )
+            .unwrap();
+    }
+
+    let payload = serde_json::json!({
+        "cluster_id": cluster_id,
+        "min_size": 0,
+        "preference": [{"volume_id": "vol-1", "dir": "dirA"}],
+    })
+    .to_string();
+    let resp = post_json(addr, "/api/quarantine-cluster", &payload);
+    assert!(
+        resp.contains("409"),
+        "stale confirm must be refused: {resp}"
+    );
+    assert!(drive.join("dirA/a.txt").exists());
+    assert!(drive.join("dirB/a.txt").exists(), "nothing was applied");
+}
+
+/// A directory that is not part of the cluster cannot be ranked into it.
+#[test]
+fn a_preference_naming_an_unknown_directory_is_a_bad_request() {
+    let (db, drive) = seed_cluster_drive();
+    let addr = start(db, drive.clone());
+
+    let list = json_body(&req(
+        addr,
+        "GET /api/duplicate-clusters?min_size=0&limit=10&offset=0 HTTP/1.0\r\nHost: x\r\n\r\n",
+    ));
+    let cluster_id = list["clusters"][0]["id"].as_str().unwrap().to_string();
+
+    let payload = serde_json::json!({
+        "cluster_id": cluster_id,
+        "min_size": 0,
+        "preference": [{"volume_id": "vol-1", "dir": "dirZ"}],
+    })
+    .to_string();
+    let resp = post_json(addr, "/api/quarantine-cluster", &payload);
+    assert!(resp.contains("400"), "unknown directory: {resp}");
+    assert!(drive.join("dirB/a.txt").exists(), "nothing was applied");
+}

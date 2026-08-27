@@ -70,7 +70,9 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/detected-drives", get(api_detected_drives))
         .route("/api/duplicates", get(api_duplicates))
         .route("/api/tree-duplicates", get(api_tree_duplicates))
+        .route("/api/duplicate-clusters", get(api_duplicate_clusters))
         .route("/api/quarantine-tree", post(api_quarantine_tree))
+        .route("/api/quarantine-cluster", post(api_quarantine_cluster))
         .route("/api/quarantine/status", get(api_quarantine_status))
         .route("/api/copies", get(api_copies))
         .route("/api/volumes/:id/errors", get(api_volume_errors))
@@ -984,6 +986,89 @@ async fn api_quarantine(
 }
 
 #[derive(Deserialize)]
+struct QuarantineClusterReq {
+    cluster_id: String,
+    /// The review floor the client rendered the cluster with. Resolving with a different floor
+    /// would act on groups whose blast radius the user was never shown.
+    min_size: Option<i64>,
+    #[serde(default)]
+    preference: Vec<crate::catalog::clusters::ClusterDir>,
+}
+
+#[derive(Serialize, Default)]
+struct QuarantineClusterDto {
+    queued: usize,
+    skipped: usize,
+    /// Copies inside archives. Reported so the user knows what the confirm could not reach; a zip
+    /// entry needs a repack or an extraction, not a rename.
+    archived_skipped: i64,
+    position: usize,
+    unmounted_volumes: Vec<String>,
+}
+
+/// Confirm one cluster: resolve the user's directory ranking into ids and enqueue them (#78).
+///
+/// The confirm only ENQUEUES. Every file still goes through the worker's disk-aware last-copy
+/// guard one at a time, so a cluster decision can never bypass a safety check.
+async fn api_quarantine_cluster(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Json<QuarantineClusterReq>,
+) -> Result<Json<QuarantineClusterDto>, (StatusCode, String)> {
+    check_csrf(&headers, &state)?;
+    use crate::catalog::clusters::ClusterResolveError as E;
+
+    let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
+    let min_size = body
+        .min_size
+        .unwrap_or(crate::catalog::dedup::DEFAULT_MIN_SIZE)
+        .max(0);
+    let plan = cat
+        .cluster_victims(&body.cluster_id, min_size, &body.preference)
+        .map_err(|e| match e {
+            // 409, not 404: the request was well-formed, the world moved. The client reloads.
+            E::NoSuchCluster => (StatusCode::CONFLICT, e.to_string()),
+            E::UnknownDirectory(_) => (StatusCode::BAD_REQUEST, e.to_string()),
+            E::NotKeepable => (StatusCode::CONFLICT, e.to_string()),
+            E::Db(_) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        })?;
+
+    let mut out = QuarantineClusterDto {
+        archived_skipped: plan.archived_skipped,
+        ..Default::default()
+    };
+    let mut by_volume: std::collections::HashMap<String, Vec<i64>> =
+        std::collections::HashMap::new();
+    for id in plan.victims {
+        match cat.get_file(id).map_err(err500)? {
+            Some(rec) => by_volume.entry(rec.volume_id).or_default().push(id),
+            None => out.skipped += 1,
+        }
+    }
+    let mounts = state.mounts.snapshot();
+    for (volume_id, ids) in by_volume {
+        // A cluster spanning a connected and a disconnected drive still does the half it can, the
+        // way `api_quarantine` does: the unreachable volume is named rather than failing the whole
+        // decision the user just made.
+        if !mounts.contains_key(&volume_id) {
+            out.skipped += ids.len();
+            out.unmounted_volumes.push(volume_id);
+            continue;
+        }
+        let n = ids.len();
+        match state.quarantine_queue.enqueue_files(volume_id, ids) {
+            Some(position) => {
+                out.queued += n;
+                out.position = position;
+            }
+            // Already queued: the reviewer double-clicked, and the decision is on its way.
+            None => out.skipped += n,
+        }
+    }
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
 struct RepackReq {
     entry_id: i64,
 }
@@ -1356,6 +1441,98 @@ async fn api_tree_duplicates(
         groups,
         total,
         offset,
+    }))
+}
+
+#[derive(Deserialize)]
+struct ClusterPageParams {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    min_size: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct ClusterDirDto {
+    volume_id: String,
+    dir: String,
+    volume_label: String,
+    mounted: bool,
+    /// The scan could not open this directory, so it can never be elected keeper.
+    unreadable: bool,
+}
+
+#[derive(Serialize)]
+struct ClusterDto {
+    id: String,
+    dirs: Vec<ClusterDirDto>,
+    group_count: i64,
+    reclaimable_bytes: i64,
+    sample_names: Vec<String>,
+    archived_group_count: i64,
+    keepable: bool,
+}
+
+#[derive(Serialize)]
+struct ClustersDto {
+    clusters: Vec<ClusterDto>,
+    total: usize,
+    /// Echoed back so the client confirms with the floor it actually rendered.
+    min_size: i64,
+}
+
+/// Duplicate groups clustered by the set of directories they occupy (#78).
+///
+/// Ranked by reclaimable bytes, never by group count: the measurement behind this found the two
+/// anti-correlated -- count-ordering spends ~1,800 decisions recovering ~0.1 GiB of build output
+/// before it reaches the course folders worth ~23 GiB.
+async fn api_duplicate_clusters(
+    State(state): State<AppState>,
+    Query(p): Query<ClusterPageParams>,
+) -> Result<Json<ClustersDto>, (StatusCode, String)> {
+    let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
+    // `effective_labels`, not `volume_stats`: two drives first seen as `D:\` must not render as
+    // identical rows with identical buttons (#62).
+    let labels = cat.effective_labels().map_err(err500)?;
+    let mounts = state.mounts.snapshot();
+    let unreadable = cat.unreadable_dirs().map_err(err500)?;
+    let min_size = p
+        .min_size
+        .unwrap_or(crate::catalog::dedup::DEFAULT_MIN_SIZE)
+        .max(0);
+    let limit = p.limit.unwrap_or(100).clamp(1, 1000);
+    let offset = p.offset.unwrap_or(0);
+    let (clusters, total) = cat
+        .duplicate_clusters(min_size, limit, offset)
+        .map_err(err500)?;
+    let clusters = clusters
+        .into_iter()
+        .map(|c| ClusterDto {
+            id: c.id,
+            dirs: c
+                .dirs
+                .into_iter()
+                .map(|d| ClusterDirDto {
+                    volume_label: labels
+                        .get(&d.volume_id)
+                        .cloned()
+                        .unwrap_or_else(|| d.volume_id.clone()),
+                    mounted: mounts.contains_key(&d.volume_id),
+                    unreadable: crate::catalog::clusters::is_unreadable(&d, &unreadable),
+                    volume_id: d.volume_id,
+                    dir: d.dir,
+                })
+                .collect(),
+            group_count: c.group_count,
+            reclaimable_bytes: c.reclaimable_bytes,
+            sample_names: c.sample_names,
+            archived_group_count: c.archived_group_count,
+            keepable: c.keepable,
+        })
+        .collect();
+    Ok(Json(ClustersDto {
+        clusters,
+        total,
+        min_size,
     }))
 }
 
@@ -2183,6 +2360,41 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn duplicate_clusters_endpoint_labels_dirs_and_echoes_the_floor() {
+        let t = tempfile::tempdir().unwrap();
+        let db = t.path().join("c.db");
+        {
+            let cat = crate::catalog::Catalog::open(&db).unwrap();
+            cat.conn
+                .execute_batch(
+                    "INSERT INTO volumes(volume_id,label,identified_by,first_seen_at,last_seen_at)
+                         VALUES ('vol-1','Photos','marker',1,1);
+                     INSERT INTO files(volume_id,relative_path,filename,extension,size_bytes,
+                         content_hash,created_time,modified_time,accessed_time,category,
+                         container_chain,status,first_seen_at,last_seen_at) VALUES
+                     ('vol-1','dirA/a.txt','a.txt','txt',100,'A',100,100,NULL,'other',NULL,'active',1,1),
+                     ('vol-1','dirB/a.txt','a.txt','txt',100,'A',200,200,NULL,'other',NULL,'active',1,1);",
+                )
+                .unwrap();
+        }
+        let body = get_json(&db, "/api/duplicate-clusters?limit=10&offset=0&min_size=0").await;
+        assert_eq!(body["total"], 1);
+        let c = &body["clusters"][0];
+        assert_eq!(c["group_count"], 1);
+        assert_eq!(c["reclaimable_bytes"], 100);
+        assert_eq!(c["dirs"][0]["volume_label"], "Photos");
+        assert_eq!(c["dirs"][0]["dir"], "dirA");
+        assert_eq!(c["dirs"][0]["unreadable"], false);
+        assert_eq!(c["keepable"], true);
+        assert_eq!(body["min_size"], 0);
+
+        // The floor defaults to the review floor, which hides a 100-byte group entirely.
+        let body = get_json(&db, "/api/duplicate-clusters").await;
+        assert_eq!(body["total"], 0);
+        assert_eq!(body["min_size"], crate::catalog::dedup::DEFAULT_MIN_SIZE);
     }
 
     #[tokio::test]

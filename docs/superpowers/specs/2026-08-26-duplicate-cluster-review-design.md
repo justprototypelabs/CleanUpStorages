@@ -1,6 +1,6 @@
 # Duplicate cluster review — design
 
-**Status:** proposed
+**Status:** accepted
 **Date:** 2026-08-26
 **Epic:** #27 (make duplicate review usable at millions-of-files scale)
 **Builds on:** #38 / spec `2026-08-06-identical-tree-collapse` (one decision per *identical* folder)
@@ -60,6 +60,9 @@ course folders — a whole tree filed inside a sibling by accident. One decision
 | Uncatalogued files | **Warned, not blocking** | Same argument. 12 on `D:`, 15 on `E:` as of 2026-08-26 |
 | Archived copies | **Shown, never quarantined** | Existing rule. A copy inside a zip needs repack or extraction, not a rename. A cluster whose only redundant copies are archived offers no confirm |
 | Derived data | **Computed on demand, never stored** | Like `duplicate_groups_ranked`, this is a query over `files`. Storing it would add a second thing to invalidate on every quarantine |
+| The confirm carries the review floor | **`POST` takes `min_size`** | Cluster membership is computed over groups at or above the floor. Resolving the confirm floor-free would quarantine sub-floor groups in the same directories — a blast radius larger than the one the user was shown |
+
+**Plan:** [`docs/superpowers/plans/2026-08-27-duplicate-cluster-review.md`](../plans/2026-08-27-duplicate-cluster-review.md)
 
 ## Architecture
 
