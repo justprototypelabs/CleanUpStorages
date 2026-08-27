@@ -215,8 +215,17 @@ pub fn scope_check_with_space(
 /// `C:evil.txt` has no `..` and is not `is_absolute()` either (a prefix with no root) -- yet
 /// `PathBuf::push` documents that joining such a path REPLACES the base rather than appending to
 /// it, so `dest_abs.join` would silently escape the destination entirely. Rejecting every
-/// component that is not `Component::Normal` catches `Prefix`, `RootDir`, `CurDir` and
-/// `ParentDir` uniformly, on both platforms. Entry names in both formats are `/`-separated by
+/// component that is not `Component::Normal` catches `Prefix`, `RootDir` and `CurDir` and
+/// `ParentDir` -- but ONLY on Windows, because `Path`'s component parsing is platform-specific:
+/// on macOS `Path::new("C:evil.txt").components()` yields a single `Normal`, since `:` is an
+/// ordinary filename character there. A drive-relative name is therefore rejected explicitly, by
+/// the colon, on every platform rather than left to `components()`. That is deliberate and not
+/// merely belt-and-braces: these drives are carried between Windows and macOS, so an entry the
+/// extractor writes on one must be a name the other can open -- and a colon also encodes an NTFS
+/// alternate data stream (`file.txt:hidden`), which is its own escape on Windows. A `.zip` built
+/// on Linux holding a legitimately-colonned name is refused whole, with its reason named; that is
+/// the safe direction, and the archive is left untouched for the user to handle by hand.
+/// Entry names in both formats are `/`-separated by
 /// spec, so a literal `\` is a lying name regardless of what `components()` makes of it -- kept as
 /// an explicit check. An EMPTY name is also checked explicitly: `Path::new("").components()`
 /// yields no components at all, so `.all(..)` over it is vacuously true and would let an empty
@@ -229,6 +238,7 @@ pub fn scope_check_with_space(
 fn entry_name_escapes(name: &str) -> bool {
     name.is_empty()
         || name.contains('\\')
+        || name.contains(':')
         || !Path::new(name)
             .components()
             .all(|c| matches!(c, std::path::Component::Normal(_)))
@@ -1230,8 +1240,13 @@ mod tests {
         // `C:evil.txt` has no `..` and Path::is_absolute() is false for it (a prefix with no
         // root), but PathBuf::push documents that joining such a path REPLACES the base path
         // rather than appending to it -- so `dest_abs.join("C:evil.txt")` would silently discard
-        // `dest_abs` entirely on Windows. This is the exact bypass the components() check exists
-        // to catch.
+        // `dest_abs` entirely on Windows.
+        //
+        // Asserted on BOTH platforms deliberately. `components()` alone does not catch this on
+        // macOS, where `:` is an ordinary filename character and the whole thing parses as one
+        // `Normal` component -- so this test failed on macOS CI until the guard rejected the
+        // colon explicitly. The name must be refused everywhere, because these drives are carried
+        // between the two: a file macOS would happily create here is a name Windows cannot open.
         let tmp = tempfile::tempdir().unwrap();
         let zip_path = tmp.path().join("evil2.zip");
         write_zip(&zip_path, &[("C:evil.txt", b"NOPE")]);
