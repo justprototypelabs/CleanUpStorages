@@ -178,7 +178,12 @@ pub fn quarantine_files(
 /// in place and is reported, not silently dropped), `mark_quarantined`, and the audit log. Actions
 /// carry a `"via": "extract"` marker so this path is distinguishable from an ordinary
 /// duplicate-review quarantine in the log.
-pub fn quarantine_extracted_archive(
+///
+/// `pub(crate)`, not `pub`: this is the guard-free quarantine path described above -- it trusts
+/// its caller to have already proven catalogue state, rather than re-deriving survival itself the
+/// way `quarantine_files` does. `extract::extract_archive` is its only intended caller; nothing
+/// outside the crate should be able to reach it.
+pub(crate) fn quarantine_extracted_archive(
     cat: &Catalog,
     mount_root: &Path,
     expected_volume_id: &str,
