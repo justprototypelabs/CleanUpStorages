@@ -146,6 +146,155 @@ pub fn quarantine_files(
     Ok(out)
 }
 
+/// Quarantine an archive that has just been extracted (#77).
+///
+/// `quarantine_files`'s last-copy guard proves survival by finding another ACTIVE row that
+/// currently holds the SAME catalogued hash — built for confirmed-duplicate FILES, where two rows
+/// legitimately share identical bytes. An archive being quarantined after extraction is a
+/// different case wearing the same shape: its catalogued hash is the hash of its own compressed
+/// container bytes, and nothing else on the volume is ever expected to hold those same bytes.
+/// Extraction does not create another copy of the CONTAINER — it creates copies of what the
+/// container held, each under its own, unrelated hash. Running the duplicate-file guard against
+/// an archive's hash would therefore refuse every extraction unconditionally: not a safety
+/// property, just a category mismatch between "prove this file's bytes survive" and "prove this
+/// container's contents survive."
+///
+/// What actually proves an extracted archive is safe to remove is not hash survival but catalogue
+/// state. `extract_archive` re-points every entry row out of the archive (via
+/// `Catalog::convert_archive_entries`) only after `verify_destination` has proven the extracted
+/// bytes match every catalogued entry. So the precondition enforced here, in place of the
+/// last-copy guard, is: no active catalogue row may still claim to live inside this archive
+/// (`relative_path` equal to the archive's own path, with `container_chain IS NOT NULL`) —
+/// checked via `Catalog::archive_entries`, the same query `scope_check` and `verify_destination`
+/// already trust. An empty result proves the conversion committed and the archive's content is
+/// now represented purely by loose (or re-pointed-nested) rows elsewhere. If any row remains, the
+/// archive still holds content nothing else has — exactly what the original guard exists to
+/// prevent — and this function refuses for the same underlying reason, just checked a different
+/// way.
+///
+/// Everything else `quarantine_files` guarantees carries over unchanged: the marker gate, the
+/// loose/active/this-volume identity check, `quarantine_dest`'s collision-free destination, the
+/// rename-only move (never copy+delete — a cross-device or permission error leaves the original
+/// in place and is reported, not silently dropped), `mark_quarantined`, and the audit log. Actions
+/// carry a `"via": "extract"` marker so this path is distinguishable from an ordinary
+/// duplicate-review quarantine in the log.
+pub fn quarantine_extracted_archive(
+    cat: &Catalog,
+    mount_root: &Path,
+    expected_volume_id: &str,
+    archive_id: i64,
+    now: i64,
+) -> anyhow::Result<QuarantineOutcome> {
+    match crate::volume::read_volume_id(mount_root) {
+        Some(vid) if vid == expected_volume_id => {}
+        Some(vid) => anyhow::bail!(
+            "drive at {} is volume {vid}, not the expected {expected_volume_id}; aborting",
+            mount_root.display()
+        ),
+        None => anyhow::bail!(
+            "no identity marker at {}; refusing to quarantine on an unidentified drive",
+            mount_root.display()
+        ),
+    }
+
+    let mut out = QuarantineOutcome::default();
+    let skip = |cat: &Catalog, reason: String, out: &mut QuarantineOutcome| -> anyhow::Result<()> {
+        cat.log_action(
+            "quarantine_skip",
+            &serde_json::json!({"file_id": archive_id, "reason": reason, "via": "extract"})
+                .to_string(),
+            now,
+        )?;
+        out.skipped += 1;
+        Ok(())
+    };
+
+    let Some(rec) = cat.get_file(archive_id)? else {
+        skip(cat, "no such file id".into(), &mut out)?;
+        return Ok(out);
+    };
+    if rec.volume_id != expected_volume_id
+        || rec.container_chain.is_some()
+        || rec.status != FileStatus::Active
+    {
+        skip(
+            cat,
+            "not a loose active file on this volume".into(),
+            &mut out,
+        )?;
+        return Ok(out);
+    }
+
+    // The precondition that replaces the last-copy guard: nothing may still claim to live inside
+    // this archive. See the doc comment above for why this is the right proof for THIS operation.
+    let remaining = cat.archive_entries(expected_volume_id, &rec.relative_path)?;
+    if !remaining.is_empty() {
+        skip(
+            cat,
+            format!(
+                "{} catalogued entr{} still point inside this archive; extraction has not fully \
+                 converted it, so the original still holds content nothing else has",
+                remaining.len(),
+                if remaining.len() == 1 { "y" } else { "ies" }
+            ),
+            &mut out,
+        )?;
+        return Ok(out);
+    }
+
+    let src = mount_root.join(&rec.relative_path);
+    if !src.is_file() {
+        skip(
+            cat,
+            format!("file not found on disk at {}", rec.relative_path),
+            &mut out,
+        )?;
+        return Ok(out);
+    }
+
+    let dest_rel = quarantine_dest(cat, mount_root, expected_volume_id, &rec.relative_path)?;
+    let dest = mount_root.join(&dest_rel);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    match std::fs::rename(&src, &dest) {
+        Ok(()) => {
+            cat.mark_quarantined(
+                archive_id,
+                &dest_rel.replace('\\', "/"),
+                &rec.relative_path,
+                now,
+            )?;
+            cat.log_action(
+                "quarantine",
+                &serde_json::json!({
+                    "file_id": archive_id, "volume_id": rec.volume_id,
+                    "from": rec.relative_path, "to": dest_rel.replace('\\', "/"),
+                    "hash": rec.content_hash, "via": "extract",
+                })
+                .to_string(),
+                now,
+            )?;
+            out.quarantined += 1;
+        }
+        Err(e) => {
+            // Cross-device or permission error: DO NOT copy+delete. Leave original in place.
+            cat.log_action(
+                "quarantine_error",
+                &serde_json::json!({
+                    "file_id": archive_id, "from": rec.relative_path, "error": e.to_string(),
+                    "via": "extract",
+                })
+                .to_string(),
+                now,
+            )?;
+            out.skipped += 1;
+        }
+    }
+    Ok(out)
+}
+
 /// Compute a collision-free `_ToDelete/<origin>` relative path (adds ` (n)` before the
 /// extension of the LAST path segment only, preserving the directory). A candidate is only
 /// acceptable when NEITHER the file exists on disk NOR a loose catalog row already claims it
@@ -541,6 +690,112 @@ mod tests {
         assert_ne!(rec.relative_path, "_ToDelete/Photos/a.jpg");
         assert_eq!(rec.relative_path, "_ToDelete/Photos/a (1).jpg");
         assert!(root.join("_ToDelete/Photos/a (1).jpg").exists());
+        let _ = tmp;
+    }
+
+    /// A catalogued archive (a loose row) with one entry row still pointing inside it -- the state
+    /// BEFORE `extract_archive` has converted anything, or after a conversion that only partially
+    /// ran. `quarantine_extracted_archive`'s whole reason to exist is refusing exactly this case.
+    fn archive_with_unconverted_entry() -> (tempfile::TempDir, Catalog, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("drive");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".cleanupstorages_id"), "vol-1").unwrap();
+        fs::write(root.join("bundle.zip"), b"ZIPBYTES").unwrap();
+
+        let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
+        cat.upsert_volume(&Volume {
+            volume_id: "vol-1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+        cat.upsert_file(
+            &crate::catalog::models::NewFile {
+                volume_id: "vol-1".into(),
+                relative_path: "bundle.zip".into(),
+                filename: "bundle.zip".into(),
+                extension: "zip".into(),
+                size_bytes: 8,
+                content_hash: "archivehash".into(),
+                created_time: None,
+                modified_time: None,
+                accessed_time: None,
+                category: crate::category::Category::from_extension("zip"),
+                container_chain: None,
+            },
+            1,
+        )
+        .unwrap();
+        cat.upsert_archive_entry(
+            "vol-1",
+            "bundle.zip",
+            &crate::archive::ArchiveEntry {
+                container_chain: "a.txt".into(),
+                filename: "a.txt".into(),
+                extension: "txt".into(),
+                size_bytes: 3,
+                content_hash: "h1".into(),
+            },
+            None,
+            1,
+        )
+        .unwrap();
+        (tmp, cat, root)
+    }
+
+    #[test]
+    fn quarantine_extracted_archive_refuses_while_a_row_still_points_inside_it() {
+        let (tmp, cat, root) = archive_with_unconverted_entry();
+        let id = cat.loose_file_id("vol-1", "bundle.zip").unwrap().unwrap();
+
+        let out = quarantine_extracted_archive(&cat, &root, "vol-1", id, 200).unwrap();
+
+        assert_eq!(
+            out,
+            QuarantineOutcome {
+                quarantined: 0,
+                skipped: 1
+            }
+        );
+        assert!(
+            root.join("bundle.zip").is_file(),
+            "refused: the archive still holds content nothing else has, so it must stay put"
+        );
+        let rec = cat.get_file(id).unwrap().unwrap();
+        assert_eq!(rec.status, crate::catalog::models::FileStatus::Active);
+        let _ = tmp;
+    }
+
+    #[test]
+    fn quarantine_extracted_archive_succeeds_once_no_row_points_inside_it() {
+        let (tmp, cat, root) = archive_with_unconverted_entry();
+        let id = cat.loose_file_id("vol-1", "bundle.zip").unwrap().unwrap();
+        // Simulate `extract_archive` having converted the one entry row out of the archive.
+        let entry_id = cat.archive_entries("vol-1", "bundle.zip").unwrap()[0].id;
+        cat.convert_archive_entries(
+            &[crate::catalog::store::EntryMove {
+                id: entry_id,
+                relative_path: "bundle/a.txt".into(),
+                container_chain: None,
+            }],
+            150,
+        )
+        .unwrap();
+
+        let out = quarantine_extracted_archive(&cat, &root, "vol-1", id, 200).unwrap();
+
+        assert_eq!(
+            out,
+            QuarantineOutcome {
+                quarantined: 1,
+                skipped: 0
+            }
+        );
+        assert!(!root.join("bundle.zip").exists());
+        assert!(root.join("_ToDelete/bundle.zip").is_file());
         let _ = tmp;
     }
 }

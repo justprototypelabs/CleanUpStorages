@@ -400,14 +400,32 @@ pub fn extract_archive(
     }
 
     // 3-5. Every refusal, before a byte is written.
-    let entries = match scope_check(cat, mount_root, expected_volume_id, archive_rel)? {
-        Scope::InScope { entries, .. } => entries,
+    match scope_check(cat, mount_root, expected_volume_id, archive_rel)? {
+        Scope::InScope { .. } => {}
         Scope::Refused(reason) => anyhow::bail!("{archive_rel}: {reason}"),
-    };
-    let _ = entries;
+    }
 
     let dest_rel = destination_dir(archive_rel);
     let dest_abs = mount_root.join(&dest_rel);
+
+    // A cleanup that fails to remove a partial destination must not swallow the real error: log
+    // it so a stray leftover folder is something the user can be told about, not a silent gap
+    // between what the catalogue believes and what is actually on disk.
+    let cleanup = |dest_abs: &Path, now: i64| {
+        if let Err(e) = std::fs::remove_dir_all(dest_abs) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                let _ = cat.log_action(
+                    "extract_cleanup_failed",
+                    &serde_json::json!({
+                        "volume_id": expected_volume_id, "archive": archive_rel,
+                        "dest": dest_abs.display().to_string(), "error": e.to_string(),
+                    })
+                    .to_string(),
+                    now,
+                );
+            }
+        }
+    };
 
     // 6-8. Write, verify, and on ANY failure remove everything this call created.
     let written = match write_level(&archive_path, &dest_abs, limits).and_then(|w| {
@@ -415,7 +433,7 @@ pub fn extract_archive(
     }) {
         Ok(w) => w,
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&dest_abs);
+            cleanup(&dest_abs, now);
             cat.log_action(
                 "extract_failed",
                 &serde_json::json!({
@@ -448,22 +466,53 @@ pub fn extract_archive(
         });
     }
     if let Err(e) = cat.convert_archive_entries(&moves, now) {
-        let _ = std::fs::remove_dir_all(&dest_abs);
+        cleanup(&dest_abs, now);
+        cat.log_action(
+            "extract_failed",
+            &serde_json::json!({
+                "volume_id": expected_volume_id, "archive": archive_rel,
+                "error": format!("catalogue conversion failed: {e}"),
+            })
+            .to_string(),
+            now,
+        )?;
         return Err(e.context("catalogue conversion failed; extraction rolled back"));
     }
 
-    // 9b. Quarantine the original through the existing engine, so the marker check, the
-    // rename-only rule and the action log all apply unchanged.
+    // 9b. Quarantine the original through the dedicated extraction path (see
+    // `quarantine_extracted_archive`'s doc comment for why it, not `quarantine_files`, is correct
+    // here). By this point the entry rows are already converted and the files are already on
+    // disk: extraction itself has fully succeeded, so a HARD failure to quarantine (a
+    // marker/volume mismatch from a drive unplugged mid-operation, say) must not be reported as a
+    // failure of the whole operation -- that would tell the caller nothing happened when in fact
+    // everything except the final rename did. It is recorded and folded into `quarantined: false`
+    // instead, exactly like an ordinary guard skip.
     let archive_id = cat
         .loose_file_id(expected_volume_id, archive_rel)?
         .ok_or_else(|| anyhow::anyhow!("no loose catalogue row for {archive_rel}"))?;
-    let q = crate::quarantine::quarantine_files(
+    let q = match crate::quarantine::quarantine_extracted_archive(
         cat,
         mount_root,
         expected_volume_id,
-        &[archive_id],
+        archive_id,
         now,
-    )?;
+    ) {
+        Ok(q) => q,
+        Err(e) => {
+            cat.log_action(
+                "extract_quarantine_failed",
+                &serde_json::json!({
+                    "volume_id": expected_volume_id, "archive": archive_rel, "error": e.to_string()
+                })
+                .to_string(),
+                now,
+            )?;
+            crate::quarantine::QuarantineOutcome {
+                quarantined: 0,
+                skipped: 1,
+            }
+        }
+    };
 
     // 10. Anything written that is itself an archive is the caller's next job.
     let nested: Vec<String> = written
@@ -643,28 +692,24 @@ mod tests {
 
         assert_eq!(out.entries_converted, 2);
         assert_eq!(out.dest_relative_path, "bundle");
-        // `quarantine_files` runs its disk-aware last-copy guard against the ARCHIVE's own hash
-        // (the compressed zip bytes), not against the hashes of what it contained. A freshly
-        // extracted archive's own bytes are its own, one-off content -- nothing else on the volume
-        // holds them -- so `find_surviving_copy` correctly reports no surviving copy and skips.
-        // This is the guard working as designed (see verify.rs), not a bug to route around: the
-        // task brief itself says this outcome must be reported honestly rather than assumed away
-        // ("Watch this one"), so this test asserts the behavior actually produced by the real,
-        // unweakened guard rather than the brief's aspirational `assert!(out.quarantined)`.
-        assert!(
-            !out.quarantined,
-            "no other copy of the archive's own bytes exists, so the last-copy guard correctly \
-             refuses to remove it -- extraction succeeded, the original is simply left in place"
-        );
+        // Quarantine now runs through `quarantine_extracted_archive`, whose precondition is
+        // "no catalogued row still points inside this archive" rather than "another copy of
+        // these exact bytes exists elsewhere" -- see its doc comment in quarantine.rs for why
+        // that is the correct proof for an archive that has just been converted. Both rows were
+        // converted above, so the precondition holds and this must actually quarantine.
+        assert!(out.quarantined);
         assert_eq!(
             std::fs::read(tmp.path().join("bundle/a.txt")).unwrap(),
             b"AAA"
         );
         assert!(
-            tmp.path().join("bundle.zip").is_file(),
-            "guard skipped quarantine, so the original stays exactly where it was"
+            !tmp.path().join("bundle.zip").is_file(),
+            "original moved out of the way"
         );
-        assert!(!tmp.path().join("_ToDelete/bundle.zip").exists());
+        assert!(
+            tmp.path().join("_ToDelete/bundle.zip").is_file(),
+            "original is in quarantine, never deleted"
+        );
         let loose = cat.loose_file_id("vol-1", "bundle/a.txt").unwrap();
         assert!(
             loose.is_some(),
