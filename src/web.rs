@@ -77,6 +77,8 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/preview/:id", get(api_preview))
         .route("/api/quarantine", post(api_quarantine))
         .route("/api/repack", post(api_repack))
+        .route("/api/archives", get(api_archives))
+        .route("/api/extract", post(api_extract))
         .route("/api/forget-drive", post(api_forget_drive))
         .route("/api/rename-drive", post(api_rename_drive))
         .route("/api/purge-all", post(api_purge_all))
@@ -1017,6 +1019,138 @@ async fn api_repack(
         removed_entry: out.removed_entry,
         retained_entries: out.retained_entries,
     }))
+}
+
+#[derive(Serialize)]
+struct ArchiveDto {
+    relative_path: String,
+    entries: i64,
+    uncompressed_bytes: i64,
+    /// `None` when the drive is not connected: scope is only ever computed against a live mount,
+    /// because an assumed `E:\` silently invalidates the whole path-length check.
+    in_scope: Option<bool>,
+    reason: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ArchiveVolumeDto {
+    volume_id: String,
+    label: String,
+    connected: bool,
+    archives: Vec<ArchiveDto>,
+}
+
+/// List every archive that still has active catalogued entries, one row per volume, with a scope
+/// verdict per archive.
+///
+/// The verdict is computed live -- `scope_check` stats the destination and reads free space -- so
+/// it is only ever attempted against a volume that is actually mounted right now (`connected`).
+/// Guessing at an unmounted drive's path would silently invalidate the whole path-length check, so
+/// an offline drive gets `in_scope: null` for every archive rather than a false `false`.
+async fn api_archives(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ArchiveVolumeDto>>, (StatusCode, String)> {
+    let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
+    let mounts = state.mounts.snapshot();
+    // `effective_labels`, not `volume_stats`'s own label column: same reasoning as
+    // `api_tree_duplicates` above -- the custom name set on the Drives page is what disambiguates
+    // two drives that were both first seen as `D:\`.
+    let labels = cat.effective_labels().map_err(err500)?;
+    let mut out = Vec::new();
+    for (volume_id, _label, _active_files, _active_bytes) in cat.volume_stats().map_err(err500)? {
+        let mount = mounts.get(&volume_id);
+        let mut archives = Vec::new();
+        for root in cat.archive_roots(&volume_id).map_err(err500)? {
+            let (in_scope, reason) = match mount {
+                None => (None, None),
+                Some(m) => {
+                    match crate::extract::scope_check(&cat, m, &volume_id, &root.relative_path)
+                        .map_err(err500)?
+                    {
+                        crate::extract::Scope::InScope { .. } => (Some(true), None),
+                        crate::extract::Scope::Refused(r) => (Some(false), Some(r)),
+                    }
+                }
+            };
+            archives.push(ArchiveDto {
+                relative_path: root.relative_path,
+                entries: root.entries,
+                uncompressed_bytes: root.uncompressed_bytes,
+                in_scope,
+                reason,
+            });
+        }
+        out.push(ArchiveVolumeDto {
+            label: labels
+                .get(&volume_id)
+                .cloned()
+                .unwrap_or_else(|| volume_id.clone()),
+            connected: mount.is_some(),
+            volume_id,
+            archives,
+        });
+    }
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+struct ExtractReq {
+    volume_id: String,
+    paths: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct Refusal {
+    path: String,
+    reason: String,
+}
+
+#[derive(Default, Serialize)]
+struct ExtractQueuedDto {
+    queued: usize,
+    skipped: usize,
+    refusals: Vec<Refusal>,
+}
+
+/// Enqueue extractions for one or more archives on the same volume and return immediately.
+///
+/// Each path is re-checked against `scope_check` here, against the live mount, before it is
+/// queued -- so a bulk request reports every refusal up front rather than silently dropping some
+/// archives and filling the queue with jobs that would each fail one at a time. The worker
+/// re-checks regardless immediately before it acts, which is the only point at which this check is
+/// not already stale.
+async fn api_extract(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Json<ExtractReq>,
+) -> Result<Json<ExtractQueuedDto>, (StatusCode, String)> {
+    check_csrf(&headers, &state)?;
+    let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
+    let Some(mount) = state.mounts.snapshot().get(&body.volume_id).cloned() else {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("drive {} is not connected", body.volume_id),
+        ));
+    };
+    let mut out = ExtractQueuedDto::default();
+    for path in &body.paths {
+        match crate::extract::scope_check(&cat, &mount, &body.volume_id, path).map_err(err500)? {
+            crate::extract::Scope::Refused(reason) => {
+                out.skipped += 1;
+                out.refusals.push(Refusal {
+                    path: path.clone(),
+                    reason,
+                });
+            }
+            crate::extract::Scope::InScope { .. } => {
+                state
+                    .quarantine_queue
+                    .enqueue_extract(body.volume_id.clone(), path.clone());
+                out.queued += 1;
+            }
+        }
+    }
+    Ok(Json(out))
 }
 
 #[derive(Serialize)]
