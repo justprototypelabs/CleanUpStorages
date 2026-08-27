@@ -245,10 +245,19 @@ fn entry_name_escapes(name: &str) -> bool {
 ///
 /// Any error leaves cleanup to the caller (`extract_archive` deletes the whole destination), which
 /// is why neither format-specific function below ever tries to unwind half of its own work.
+///
+/// `budget_bytes` is the total this archive is permitted to write, cumulative across every entry.
+/// It exists because the preflight in `scope_check_with_space` only sums bytes for entries the
+/// catalogue actually has rows for -- an entry the scan skipped (over `entry_max_bytes`, over the
+/// zip `ratio_cap`, or added to the archive after the last scan) has no row and so is invisible to
+/// that reservation, but this writer would still stream it to disk. Passing the same figure the
+/// preflight reserved (see `extract_archive`) means the writer can never write more than the
+/// preflight actually secured, regardless of what the archive itself turns out to contain.
 pub fn write_level(
     archive_path: &Path,
     dest_abs: &Path,
     limits: &crate::archive::ArchiveLimits,
+    budget_bytes: u64,
 ) -> anyhow::Result<Vec<String>> {
     let mut head = [0u8; 6];
     let filled = {
@@ -263,9 +272,9 @@ pub fn write_level(
         filled
     };
     if crate::archive::looks_like_7z(&head[..filled]) {
-        write_7z_level(archive_path, dest_abs, limits)
+        write_7z_level(archive_path, dest_abs, limits, budget_bytes)
     } else {
-        write_zip_level(archive_path, dest_abs, limits)
+        write_zip_level(archive_path, dest_abs, limits, budget_bytes)
     }
 }
 
@@ -276,10 +285,12 @@ fn write_zip_level(
     archive_path: &Path,
     dest_abs: &Path,
     limits: &crate::archive::ArchiveLimits,
+    budget_bytes: u64,
 ) -> anyhow::Result<Vec<String>> {
     let file = std::fs::File::open(archive_path)?;
     let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file))?;
     let mut written = Vec::new();
+    let mut cumulative: u64 = 0;
 
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
@@ -319,6 +330,14 @@ fn write_zip_level(
             if total > cap {
                 anyhow::bail!("entry {name} exceeds the size cap {cap} bytes");
             }
+            cumulative += n as u64;
+            if cumulative > budget_bytes {
+                anyhow::bail!(
+                    "{} holds more content than the catalogue knows about: writing exceeded the \
+                     reserved {budget_bytes} bytes; rescan the archive and try again",
+                    archive_path.display()
+                );
+            }
             std::io::Write::write_all(&mut out, &buf[..n])?;
         }
         std::io::Write::flush(&mut out)?;
@@ -344,6 +363,7 @@ fn write_7z_level(
     archive_path: &Path,
     dest_abs: &Path,
     limits: &crate::archive::ArchiveLimits,
+    budget_bytes: u64,
 ) -> anyhow::Result<Vec<String>> {
     let file = std::fs::File::open(archive_path)?;
     let mut archive = sevenz_rust2::SevenZReader::new(
@@ -352,6 +372,7 @@ fn write_7z_level(
     )?;
     let cap = limits.entry_max_bytes.unwrap_or(u64::MAX);
     let mut written = Vec::new();
+    let mut cumulative: u64 = 0;
 
     archive.for_each_entries(|entry, r| {
         if entry.is_directory {
@@ -385,6 +406,14 @@ fn write_7z_level(
             if total > cap {
                 return Err(sevenz_rust2::Error::other(format!(
                     "entry {name} exceeds the size cap {cap} bytes"
+                )));
+            }
+            cumulative += n as u64;
+            if cumulative > budget_bytes {
+                return Err(sevenz_rust2::Error::other(format!(
+                    "{} holds more content than the catalogue knows about: writing exceeded the \
+                     reserved {budget_bytes} bytes; rescan the archive and try again",
+                    archive_path.display()
                 )));
             }
             std::io::Write::write_all(&mut out, &buf[..n])
@@ -435,17 +464,30 @@ pub fn verify_destination(
             .strip_prefix(dest_abs)?
             .to_string_lossy()
             .replace('\\', "/");
-        let ext = rel
-            .rsplit('/')
-            .next()
-            .and_then(|l| l.rsplit_once('.'))
-            .map(|(_, e)| e.to_ascii_lowercase())
-            .unwrap_or_default();
 
-        let descend = matches!(
-            crate::archive::descent_for(&ext, &limits.deny_extensions, &limits.allow_extensions),
-            crate::archive::Descent::Descend
-        );
+        // Descend by CONTENT signature, exactly as `write_level` decided what to write and the
+        // scanner's nested descent (`is_nested_archive` in `scan_level`, `archive.rs`) decided what
+        // to catalogue -- never by `descent_for`'s extension policy. The catalogue was built by the
+        // scanner's content-based decision: a `.docx` that is actually a zip gets descended into and
+        // catalogued as `report.docx › word/document.xml` regardless of the deny list, because the
+        // deny list only gates the *top level* and the nested-enqueue filter, not this. Deciding by
+        // extension here would refuse to descend into that same file at verify time, conclude the
+        // catalogued chain is "missing", and fail an extraction that actually succeeded.
+        let mut head = [0u8; 6];
+        let filled = {
+            let mut f = std::fs::File::open(entry.path())
+                .with_context(|| format!("could not read {rel}"))?;
+            let mut filled = 0;
+            while filled < head.len() {
+                match f.read(&mut head[filled..])? {
+                    0 => break,
+                    n => filled += n,
+                }
+            }
+            filled
+        };
+        let descend = crate::archive::looks_like_zip(&head[..filled])
+            || crate::archive::looks_like_7z(&head[..filled]);
         if descend {
             let f = std::fs::File::open(entry.path())
                 .with_context(|| format!("could not read {rel}"))?;
@@ -541,10 +583,12 @@ pub fn extract_archive(
     }
 
     // 3-5. Every refusal, before a byte is written.
-    match scope_check(cat, mount_root, expected_volume_id, archive_rel)? {
-        Scope::InScope { .. } => {}
+    let budget_bytes = match scope_check(cat, mount_root, expected_volume_id, archive_rel)? {
+        Scope::InScope {
+            uncompressed_bytes, ..
+        } => uncompressed_bytes as u64 + SPACE_HEADROOM_BYTES,
         Scope::Refused(reason) => anyhow::bail!("{archive_rel}: {reason}"),
-    }
+    };
 
     let dest_rel = destination_dir(archive_rel);
     let dest_abs = mount_root.join(&dest_rel);
@@ -569,7 +613,7 @@ pub fn extract_archive(
     };
 
     // 6-8. Write, verify, and on ANY failure remove everything this call created.
-    let written = match write_level(&archive_path, &dest_abs, limits).and_then(|w| {
+    let written = match write_level(&archive_path, &dest_abs, limits, budget_bytes).and_then(|w| {
         verify_destination(cat, expected_volume_id, archive_rel, &dest_abs, limits).map(|_| w)
     }) {
         Ok(w) => w,
@@ -910,6 +954,40 @@ mod tests {
     }
 
     #[test]
+    fn a_write_failure_leaves_the_drive_untouched_end_to_end() {
+        // `write_level`'s budget refusal (`write_level_refuses_an_archive_that_writes_more_than_its_budget`)
+        // proves the mechanism itself; this proves the surrounding contract at the `extract_archive`
+        // level that a budget refusal shares with every other `write_level` failure: the partial
+        // destination is removed and the archive and catalogue are left exactly as they were.
+        // `entry_max_bytes` is used here because it is the cheapest way to trip a real `write_level`
+        // error without an actual multi-gigabyte archive; the cleanup path it exercises is identical
+        // to the one a real budget refusal takes.
+        let tmp = tempfile::tempdir().unwrap();
+        let (cat, _) = real_scan_fixture(&tmp, &[("a.txt", b"AAAAAAAAAA")]);
+        let mut limits = test_limits();
+        limits.entry_max_bytes = Some(2);
+
+        let err =
+            extract_archive(&cat, tmp.path(), "vol-1", "bundle.zip", &limits, 100).unwrap_err();
+
+        assert!(format!("{err}").contains("size cap"), "{err}");
+        assert!(
+            !tmp.path().join("bundle").exists(),
+            "destination cleaned up"
+        );
+        assert!(
+            tmp.path().join("bundle.zip").is_file(),
+            "original archive untouched, never quarantined"
+        );
+        assert!(
+            cat.archive_entries("vol-1", "bundle.zip").unwrap()[0]
+                .container_chain
+                .is_some(),
+            "catalogue untouched"
+        );
+    }
+
+    #[test]
     fn a_corrupt_entry_fails_the_archive_and_leaves_the_drive_untouched() {
         let tmp = tempfile::tempdir().unwrap();
         let (cat, _) = real_scan_fixture(&tmp, &[("a.txt", b"AAA")]);
@@ -975,6 +1053,50 @@ mod tests {
         assert_eq!(row[0].container_chain.as_deref(), Some("deep.txt"));
     }
 
+    /// `bundle.zip` containing `report.docx` (itself a real zip, descended by the scanner because
+    /// its content signature is a zip, exactly as a real `.docx` is) containing `word/doc.xml`,
+    /// catalogued by a real (recursive) scan -- so the flattened chain
+    /// `report.docx › word/doc.xml` is exactly what the scanner would have written, with no
+    /// catalogue row for `report.docx` itself. This is the extension `verify_destination` must NOT
+    /// consult `descent_for` for: `docx` is deny-listed, but the scanner still descended into it.
+    fn real_docx_nested_scan_fixture(tmp: &tempfile::TempDir) -> (Catalog, std::path::PathBuf) {
+        let inner_tmp = tmp.path().join("inner_report.docx");
+        write_zip(&inner_tmp, &[("word/doc.xml", b"<x/>")]);
+        let inner_bytes = std::fs::read(&inner_tmp).unwrap();
+        std::fs::remove_file(&inner_tmp).unwrap();
+
+        real_scan_fixture(tmp, &[("report.docx", &inner_bytes)])
+    }
+
+    #[test]
+    fn a_nested_deny_listed_extension_still_verifies_by_content() {
+        // Regression for the bug where `verify_destination` decided whether to descend by
+        // `descent_for(ext, ..)` instead of the file's real content signature. A `.docx` that is
+        // actually a zip (as every real `.docx` is) gets descended into and catalogued by the
+        // scanner regardless of the deny list -- the deny list only gates the top level and the
+        // nested-enqueue filter. Deciding by extension at verify time would see `docx` on the
+        // deny list, refuse to descend, and report the catalogued chain
+        // "report.docx › word/doc.xml" as missing even though it is genuinely present on disk.
+        let tmp = tempfile::tempdir().unwrap();
+        let (cat, _) = real_docx_nested_scan_fixture(&tmp);
+
+        let out =
+            extract_archive(&cat, tmp.path(), "vol-1", "bundle.zip", &test_limits(), 100).unwrap();
+
+        assert_eq!(
+            out.nested_archives,
+            Vec::<String>::new(),
+            "docx is deny-listed for its own follow-up job"
+        );
+        assert!(
+            tmp.path().join("bundle/report.docx").is_file(),
+            "the nested docx is written as a plain file"
+        );
+        let row = cat.archive_entries("vol-1", "bundle/report.docx").unwrap();
+        assert_eq!(row.len(), 1);
+        assert_eq!(row[0].container_chain.as_deref(), Some("word/doc.xml"));
+    }
+
     #[test]
     fn a_deny_listed_zip_document_is_never_extracted() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1004,11 +1126,37 @@ mod tests {
         write_zip(&zip_path, &[("a.txt", b"AAA"), ("sub/b.txt", b"BBB")]);
         let dest = tmp.path().join("bundle");
 
-        let written = write_level(&zip_path, &dest, &test_limits()).unwrap();
+        let written = write_level(&zip_path, &dest, &test_limits(), u64::MAX).unwrap();
 
         assert_eq!(written, vec!["a.txt".to_string(), "sub/b.txt".to_string()]);
         assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"AAA");
         assert_eq!(std::fs::read(dest.join("sub/b.txt")).unwrap(), b"BBB");
+    }
+
+    #[test]
+    fn write_level_refuses_an_archive_that_writes_more_than_its_budget() {
+        // The preflight in `scope_check_with_space` only sums bytes for CATALOGUED entries; an
+        // entry the scan skipped (too big, over the ratio cap, or added after the last scan) has
+        // no row and so is invisible to that reservation. `write_level` must still refuse once
+        // cumulative bytes written cross what was actually reserved, regardless of what the
+        // archive itself turns out to hold -- otherwise a preflight that reserved a few bytes
+        // would let an uncatalogued multi-gigabyte entry stream straight to disk.
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("bundle.zip");
+        write_zip(&zip_path, &[("a.txt", b"AAA"), ("b.txt", b"BBBBBBBBBB")]);
+        let dest = tmp.path().join("bundle");
+
+        // Budget covers "a.txt" (3 bytes) but not the full second entry.
+        let err = write_level(&zip_path, &dest, &test_limits(), 5).unwrap_err();
+
+        assert!(
+            format!("{err}").contains("more content than the catalogue knows about"),
+            "must name the real diagnosis: {err}"
+        );
+        assert!(
+            format!("{err}").contains("5"),
+            "must name the budget: {err}"
+        );
     }
 
     #[test]
@@ -1018,7 +1166,7 @@ mod tests {
         write_zip(&zip_path, &[("../escaped.txt", b"NOPE")]);
         let dest = tmp.path().join("evil");
 
-        let err = write_level(&zip_path, &dest, &test_limits()).unwrap_err();
+        let err = write_level(&zip_path, &dest, &test_limits(), u64::MAX).unwrap_err();
         assert!(format!("{err}").contains("escapes"), "got: {err}");
         assert!(
             !tmp.path().join("escaped.txt").exists(),
@@ -1038,7 +1186,7 @@ mod tests {
         write_zip(&zip_path, &[("C:evil.txt", b"NOPE")]);
         let dest = tmp.path().join("evil2");
 
-        let err = write_level(&zip_path, &dest, &test_limits()).unwrap_err();
+        let err = write_level(&zip_path, &dest, &test_limits(), u64::MAX).unwrap_err();
         assert!(format!("{err}").contains("escapes"), "got: {err}");
         assert!(
             !tmp.path().join("evil.txt").exists(),
@@ -1112,7 +1260,7 @@ mod tests {
 
         let dest = tmp.path().join("evil3");
 
-        let err = write_level(&zip_path, &dest, &test_limits()).unwrap_err();
+        let err = write_level(&zip_path, &dest, &test_limits(), u64::MAX).unwrap_err();
         assert!(format!("{err}").contains("escapes"), "got: {err}");
         assert!(
             !dest.exists(),
@@ -1129,7 +1277,7 @@ mod tests {
         let mut limits = test_limits();
         limits.entry_max_bytes = Some(1024);
 
-        let err = write_level(&zip_path, &dest, &limits).unwrap_err();
+        let err = write_level(&zip_path, &dest, &limits, u64::MAX).unwrap_err();
         assert!(
             format!("{err}").contains("1024"),
             "must report the cap: {err}"
@@ -1146,7 +1294,7 @@ mod tests {
         write_7z(&path, &[("a.txt", b"AAA"), ("sub/b.txt", b"BBB")]);
         let dest = tmp.path().join("bundle");
 
-        let written = write_level(&path, &dest, &test_limits()).unwrap();
+        let written = write_level(&path, &dest, &test_limits(), u64::MAX).unwrap();
 
         assert_eq!(written, vec!["a.txt".to_string(), "sub/b.txt".to_string()]);
         assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"AAA");
@@ -1162,7 +1310,7 @@ mod tests {
         write_7z(&path, &[("../escaped.txt", b"NOPE")]);
         let dest = tmp.path().join("evil");
 
-        let err = write_level(&path, &dest, &test_limits()).unwrap_err();
+        let err = write_level(&path, &dest, &test_limits(), u64::MAX).unwrap_err();
         assert!(format!("{err}").contains("escapes"), "got: {err}");
         assert!(
             !tmp.path().join("escaped.txt").exists(),
@@ -1182,7 +1330,7 @@ mod tests {
         let mut limits = test_limits();
         limits.entry_max_bytes = Some(1024);
 
-        let err = write_level(&path, &dest, &limits).unwrap_err();
+        let err = write_level(&path, &dest, &limits, u64::MAX).unwrap_err();
         assert!(
             format!("{err}").contains("1024"),
             "must report the cap: {err}"
@@ -1338,6 +1486,44 @@ mod tests {
         match scope_check(&cat, tmp.path(), "vol-1", "bundle.zip").unwrap() {
             Scope::Refused(r) => assert!(r.contains("bundle"), "refusal must name the folder: {r}"),
             Scope::InScope { .. } => panic!("must never merge into an existing folder"),
+        }
+    }
+
+    #[test]
+    fn insufficient_free_space_refuses_before_writing_a_byte() {
+        // Spec test #6 ("Insufficient free space refuses before writing a byte") had no directed
+        // test of its own -- this proves the `free < required` branch of
+        // `scope_check_with_space`, naming both figures, and that nothing is written.
+        let tmp = tempfile::tempdir().unwrap();
+        let cat = catalog_with_entries(&tmp, &[("a.txt", 4, "h1")]);
+        let required = 4u64 + SPACE_HEADROOM_BYTES;
+
+        match scope_check_with_space(&cat, tmp.path(), "vol-1", "bundle.zip", Some(required - 1))
+            .unwrap()
+        {
+            Scope::Refused(r) => {
+                assert!(
+                    r.contains(&required.to_string()),
+                    "must state what's needed: {r}"
+                );
+                assert!(
+                    r.contains(&(required - 1).to_string()),
+                    "must state what's available: {r}"
+                );
+            }
+            Scope::InScope { .. } => panic!("must refuse when free space is short"),
+        }
+        assert!(!tmp.path().join("bundle").exists(), "nothing written");
+    }
+
+    #[test]
+    fn unknown_free_space_refuses_rather_than_guessing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cat = catalog_with_entries(&tmp, &[("a.txt", 4, "h1")]);
+
+        match scope_check_with_space(&cat, tmp.path(), "vol-1", "bundle.zip", None).unwrap() {
+            Scope::Refused(r) => assert!(r.contains("could not determine free space"), "{r}"),
+            Scope::InScope { .. } => panic!("unknown free space must refuse, not assume"),
         }
     }
 
