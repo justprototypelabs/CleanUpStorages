@@ -672,16 +672,25 @@ pub fn extract_archive(
     // failure of the whole operation -- that would tell the caller nothing happened when in fact
     // everything except the final rename did. It is recorded and folded into `quarantined: false`
     // instead, exactly like an ordinary guard skip.
-    let archive_id = cat
-        .loose_file_id(expected_volume_id, archive_rel)?
-        .ok_or_else(|| anyhow::anyhow!("no loose catalogue row for {archive_rel}"))?;
-    let q = match crate::quarantine::quarantine_extracted_archive(
-        cat,
-        mount_root,
-        expected_volume_id,
-        archive_id,
-        now,
-    ) {
+    // The lookup itself is folded into the same fallible path as the quarantine call below: by
+    // this point extraction has fully succeeded (rows converted, files on disk), so a failure to
+    // even FIND the archive's own loose row (a task 6 class of bug: `?` firing after the real work
+    // is already committed) must not be reported as failure of the whole operation either -- it is
+    // recorded and folded into `quarantined: false` exactly like a hard quarantine failure.
+    let q = match cat
+        .loose_file_id(expected_volume_id, archive_rel)
+        .and_then(|id| {
+            id.ok_or_else(|| anyhow::anyhow!("no loose catalogue row for {archive_rel}"))
+        })
+        .and_then(|archive_id| {
+            crate::quarantine::quarantine_extracted_archive(
+                cat,
+                mount_root,
+                expected_volume_id,
+                archive_id,
+                now,
+            )
+        }) {
         Ok(q) => q,
         Err(e) => {
             cat.log_action(
@@ -934,6 +943,48 @@ mod tests {
         assert!(
             loose.is_some(),
             "extracted file is now a loose catalogue row"
+        );
+    }
+
+    #[test]
+    fn a_missing_archive_loose_row_is_reported_not_treated_as_total_failure() {
+        // Regression: `loose_file_id` returning `None` used to `?` out of `extract_archive` with
+        // `Err` AFTER `convert_archive_entries` had already committed and the files were already on
+        // disk -- so a fully successful extraction was reported to the caller as a hard failure: no
+        // `ExtractOutcome`, no `extract` audit entry, `nested_archives` silently dropped. Delete the
+        // archive's own loose row here to force exactly that lookup failure, and prove the result is
+        // now `Ok` with `quarantined: false`, same as any other quarantine-step skip.
+        let tmp = tempfile::tempdir().unwrap();
+        let (cat, _) = real_scan_fixture(&tmp, &[("a.txt", b"AAA")]);
+        let n = cat
+            .conn
+            .execute(
+                "DELETE FROM files WHERE volume_id='vol-1' AND relative_path='bundle.zip' \
+                 AND container_chain IS NULL",
+                [],
+            )
+            .unwrap();
+        assert_eq!(n, 1, "expected exactly one loose row to remove");
+
+        let out =
+            extract_archive(&cat, tmp.path(), "vol-1", "bundle.zip", &test_limits(), 100).unwrap();
+
+        assert_eq!(
+            out.entries_converted, 1,
+            "extraction itself fully succeeded"
+        );
+        assert!(
+            !out.quarantined,
+            "quarantine step could not run without the archive's own row"
+        );
+        assert!(
+            tmp.path().join("bundle.zip").is_file(),
+            "original archive left in place, never quarantined"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("bundle/a.txt")).unwrap(),
+            b"AAA",
+            "extracted content is genuinely on disk"
         );
     }
 
