@@ -189,4 +189,20 @@ fn extract_unlocks_the_content_recurses_and_quarantines_each_archive() {
         !out.contains("bundle.zip \u{203a}"),
         "no row may still point inside the archive that just moved: {out}"
     );
+
+    // The nested archive's content must also be fully loose, not re-pointed inside inner.zip.
+    let search_nested = bin()
+        .env("CLEANUPSTORAGES_DATA_DIR", &data)
+        .args(["search", "deep.txt"])
+        .output()
+        .unwrap();
+    let out_nested = String::from_utf8_lossy(&search_nested.stdout).to_string();
+    assert!(
+        out_nested.contains("bundle/sub/inner/deep.txt"),
+        "nested file fully extracted and catalogued loose: {out_nested}"
+    );
+    assert!(
+        !out_nested.contains("inner.zip \u{203a}"),
+        "nested file must not still point inside the re-extracted archive: {out_nested}"
+    );
 }
