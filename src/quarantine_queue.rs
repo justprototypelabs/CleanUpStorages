@@ -943,6 +943,211 @@ mod tests {
         assert!(msg.contains('8'), "names the limit: {msg}");
     }
 
+    /// Writes a zip at `path` containing `files`, using the same helper shape as `extract.rs`'s
+    /// test fixtures (kept local rather than shared: `extract.rs`'s version is private to its own
+    /// test module).
+    fn write_zip(path: &std::path::Path, files: &[(&str, &[u8])]) {
+        use std::io::Write;
+        let f = std::fs::File::create(path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts: zip::write::FileOptions<()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, bytes) in files {
+            zw.start_file(*name, opts).unwrap();
+            zw.write_all(bytes).unwrap();
+        }
+        zw.finish().unwrap();
+    }
+
+    /// A real mounted "drive" with `bundle.zip` containing `inner.zip` containing `deep.txt`,
+    /// catalogued by running the real (recursive) `archive::scan_archive` over the real bytes on
+    /// disk -- so the catalogue this test exercises is exactly what a genuine scan would have
+    /// produced, never hand-written, and the extraction under test is the genuine
+    /// `extract::extract_archive`, not a stub.
+    fn nested_archive_drive() -> (tempfile::TempDir, std::path::PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let drive = tmp.path().join("driveA");
+        std::fs::create_dir_all(&drive).unwrap();
+        std::fs::write(drive.join(crate::volume::MARKER), "vol-1").unwrap();
+
+        let inner_tmp = tmp.path().join("inner_tmp.zip");
+        write_zip(&inner_tmp, &[("deep.txt", b"DEEP CONTENT")]);
+        let inner_bytes = std::fs::read(&inner_tmp).unwrap();
+        std::fs::remove_file(&inner_tmp).unwrap();
+        let bundle_path = drive.join("bundle.zip");
+        write_zip(&bundle_path, &[("inner.zip", &inner_bytes)]);
+
+        let db = tmp.path().join("c.db");
+        let cat = crate::catalog::Catalog::open(&db).unwrap();
+        cat.upsert_volume(&crate::catalog::models::Volume {
+            volume_id: "vol-1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+        cat.upsert_file(
+            &crate::catalog::models::NewFile {
+                volume_id: "vol-1".into(),
+                relative_path: "bundle.zip".into(),
+                filename: "bundle.zip".into(),
+                extension: "zip".into(),
+                size_bytes: std::fs::metadata(&bundle_path).unwrap().len() as i64,
+                content_hash: crate::hashing::hash_file(&bundle_path).unwrap(),
+                created_time: None,
+                modified_time: None,
+                accessed_time: None,
+                category: crate::category::Category::from_extension("zip"),
+                container_chain: None,
+            },
+            1,
+        )
+        .unwrap();
+        // Generous limits for the SCAN itself (cataloguing both levels): distinct from the low
+        // runtime `max_archive_depth` this test later sets via settings.json, which governs what
+        // the queue's own extraction jobs are willing to descend into, not what gets catalogued.
+        let scan_limits = crate::archive::ArchiveLimits {
+            max_depth: 8,
+            buffer_max_bytes: 2 * 1024 * 1024 * 1024,
+            total_buffer_bytes: 2 * 1024 * 1024 * 1024,
+            entry_max_bytes: Some(64 * 1024 * 1024 * 1024),
+            ratio_cap: 10_000,
+            deny_extensions: crate::config::DEFAULT_DENY
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            allow_extensions: Vec::new(),
+        };
+        let f = std::fs::File::open(&bundle_path).unwrap();
+        let scanned = crate::archive::scan_archive(std::io::BufReader::new(f), &scan_limits);
+        for e in scanned.entries {
+            cat.upsert_archive_entry("vol-1", "bundle.zip", &e, None, 1)
+                .unwrap();
+        }
+        drop(cat);
+
+        (tmp, drive, db)
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "ENV_GUARD is a test-only serialization guard (unit-value Mutex) around the \
+            process-global CLEANUPSTORAGES_DATA_DIR var, not a resource read across the await; \
+            holding it for the whole async test body -- which polls the real worker task -- is \
+            the point, matching the existing pattern in web.rs's tests"
+    )]
+    async fn a_nested_archive_from_a_real_extraction_is_enqueued_and_the_drain_waits_for_it() {
+        // This exercises the exact seam flagged for scrutiny: a real `extract_archive` call whose
+        // `ExtractOutcome.nested_archives` is non-empty, run through `run_job`, proving the nested
+        // `Job::Extract` actually lands in the queue at `depth + 1` and that the post-drain
+        // rebuild/snapshot does not fire while it is still outstanding.
+        //
+        // `max_archive_depth` is pinned to 1 via settings.json so the nested job (real depth 2)
+        // is refused -- not merely "does not error," but refused with a message naming exactly
+        // "2" and "1". That is a stronger, more specific proof that `depth` was threaded as
+        // `parent_depth + 1` than "the nested job merely ran under the default limit" would be:
+        // a reset-to-1 bug and a correctly-threaded depth=2 both pass under a generous default,
+        // but only the correct one is refused against a limit of 1.
+        let _g = crate::config::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let data_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            data_dir.path().join("settings.json"),
+            br#"{"max_archive_depth": 1}"#,
+        )
+        .unwrap();
+        let prev = std::env::var("CLEANUPSTORAGES_DATA_DIR").ok();
+        std::env::set_var("CLEANUPSTORAGES_DATA_DIR", data_dir.path());
+
+        let (_t, drive, db) = nested_archive_drive();
+        let backups = db.parent().unwrap().join("catalog.backups");
+        let mut mounts = std::collections::HashMap::new();
+        mounts.insert("vol-1".to_string(), drive.clone());
+        let q = QuarantineQueue::new(db, crate::mounts::MountResolver::Fixed(mounts));
+        tokio::spawn(q.clone().run_worker());
+        q.enqueue_extract("vol-1".into(), "bundle.zip".into());
+
+        // Concurrent observation while the two-job chain (parent, then its nested child) drains.
+        // `seen_nested_queued`: proves the nested job actually reached the queue (`pending` or
+        // `running`) at `depth + 1` -- the finding's first two asks ("lands in pending", "at the
+        // correct depth", the latter proven by the eventual refusal message below).
+        // `premature_snapshot`: proves the drained-window half -- that a rebuild/snapshot artifact
+        // never appears while the nested job's own result is still missing from `recent`. Under
+        // the pre-fix ordering (`drained` computed in the same lock scope that recorded the
+        // parent's result, before the nested job was enqueued), the parent's completion would
+        // wrongly look "drained" and fire the rebuild/snapshot while the nested job either had not
+        // yet been enqueued or was still waiting to run -- exactly the state this polls for.
+        let mut seen_nested_queued = false;
+        let mut premature_snapshot = false;
+        for _ in 0..800 {
+            let s = q.status();
+            let nested_present = s
+                .pending
+                .iter()
+                .chain(s.running.iter())
+                .any(|j| j.kind == "extract" && j.label == "bundle/inner.zip");
+            if nested_present {
+                seen_nested_queued = true;
+            }
+            let snapshot_exists = std::fs::read_dir(&backups).map(|d| d.count()).unwrap_or(0) > 0;
+            if snapshot_exists && s.recent.len() < 2 {
+                premature_snapshot = true;
+            }
+            if s.running.is_none() && s.pending.is_empty() && s.recent.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        match prev {
+            Some(v) => std::env::set_var("CLEANUPSTORAGES_DATA_DIR", v),
+            None => std::env::remove_var("CLEANUPSTORAGES_DATA_DIR"),
+        }
+        drop(_g);
+
+        assert!(
+            seen_nested_queued,
+            "the nested archive `bundle/inner.zip` never appeared in the queue at all"
+        );
+        assert!(
+            !premature_snapshot,
+            "a rebuild/snapshot artifact appeared before the nested job's result was recorded -- \
+             the drain fired one job too early"
+        );
+
+        let recent = q.status().recent;
+        assert_eq!(recent.len(), 2, "both the parent and the nested job ran");
+        let nested = recent
+            .iter()
+            .find(|r| r.label == "bundle/inner.zip")
+            .expect("the nested archive must have run as its own job");
+        assert_eq!(nested.kind, "extract");
+        assert_eq!(nested.volume_id, "vol-1");
+        let msg = nested
+            .error_message
+            .as_deref()
+            .expect("depth 2 must be refused against max_archive_depth=1");
+        assert!(msg.contains("bundle/inner.zip"), "names the path: {msg}");
+        assert!(
+            msg.contains('2'),
+            "names depth 2, proving `depth` was threaded as parent_depth + 1: {msg}"
+        );
+        assert!(msg.contains('1'), "names the limit 1: {msg}");
+
+        let parent = recent
+            .iter()
+            .find(|r| r.label == "bundle.zip")
+            .expect("the parent extraction must have run and recorded a result");
+        assert!(
+            parent.error_message.is_none(),
+            "the top-level archive (depth 1) must not be refused: {:?}",
+            parent.error_message
+        );
+    }
+
     #[tokio::test]
     async fn a_files_job_for_an_unplugged_drive_fails_loudly() {
         // The reviewer clicked. If it did not happen they must be told, because the alternative is
