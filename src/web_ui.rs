@@ -399,6 +399,7 @@ fn glyph(key: &str) -> &'static str {
         "overview" => "dashboard",
         "browse" => "folder_open",
         "duplicates" => "content_copy",
+        "extract" => "unarchive",
         "drives" => "hard_drive",
         "scan" => "frame_inspect",
         "console" => "terminal",
@@ -429,6 +430,11 @@ const NAV: &[NavItem] = &[
         key: "duplicates",
         href: "/review",
         label: "Duplicates",
+    },
+    NavItem {
+        key: "extract",
+        href: "/extract",
+        label: "Extract",
     },
     NavItem {
         key: "drives",
@@ -1344,6 +1350,137 @@ load().catch(e=>{$("#drives").textContent="Error: "+e;});"##;
     shell("drives", csrf, "Drives", main, script)
 }
 
+/// The Extract page: every catalogued archive, its scope verdict against the live mount, and the
+/// two ways to act on it (per-archive, or "enqueue all in scope" per drive). A refused archive
+/// shows its reason in place -- a refusal the user cannot see is indistinguishable from a bug, and
+/// so is a disconnected drive silently rendered as if it had been checked.
+pub fn extract_page(csrf: &str) -> String {
+    let main = r##"
+<h1 class="page-h">Extract archives</h1>
+<div class="page-sub">Extracted beside the archive, verified entry by entry against the catalogue,
+then the original archive is moved to <code>_ToDelete</code>. One archive at a time, on the same
+queue as duplicate quarantine. An archive whose contents would not fit within a 260-character path
+is refused whole -- the reason is shown under its row.</div>
+<div id="queue" class="card mut" style="margin-bottom:18px" hidden></div>
+<div id="drives"><span class="mut">Loading archives…</span></div>
+<div class="mut" id="msg" style="margin-top:12px;min-height:1.4em"></div>"##;
+
+    let script = r##"
+function verdictHtml(a){
+  if(a.in_scope===true) return '<span class="row" style="gap:6px;color:var(--green)">'
+    +'<span style="width:7px;height:7px;border-radius:50%;background:var(--green);display:inline-block;flex:none"></span>in scope</span>';
+  if(a.in_scope===false) return '<span class="row" style="gap:6px;color:var(--red)">'
+    +'<span style="width:7px;height:7px;border-radius:50%;background:var(--red);display:inline-block;flex:none"></span>refused</span>';
+  return '<span class="mut">no verdict</span>';
+}
+// Every archive renders as one CSS-grid "row" (five columns, plus an optional full-width reason
+// line) rather than a real <table> -- the same trick the Drives page uses for its error list, and
+// it keeps 1,806 rows on the live catalogue from costing a table layout pass.
+function archiveRow(a){
+  const action = a.in_scope===true
+    ? `<button class="btn" data-vol="${esc(a._vol)}" data-path="${esc(a.relative_path)}">Extract</button>`
+    : '<span></span>';
+  // The reason is a complete sentence naming its offender (from the server), rendered unconditionally
+  // whenever present -- never tucked into a title= tooltip a user might not think to hover.
+  const reason = a.reason
+    ? `<div class="mut" style="grid-column:1/-1;font-size:12px;margin:-2px 0 6px">${esc(a.reason)}</div>` : '';
+  return `<div class="mono" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(a.relative_path)}">${esc(a.relative_path)}</div>
+    <div class="mono" style="text-align:right">${fmtN(a.entries)}</div>
+    <div class="mono" style="text-align:right">${fmtSize(a.uncompressed_bytes)}</div>
+    <div>${verdictHtml(a)}</div>
+    <div>${action}</div>${reason}`;
+}
+let vols=[];
+async function load(){
+  try{ vols=await apiGet("/api/archives"); }
+  catch(e){ $("#drives").innerHTML='<span class="mut">Could not load archives: '+esc(String(e))+'</span>'; return; }
+  const host=$("#drives");
+  if(!vols.length){ host.innerHTML='<span class="mut">No catalogued archives.</span>'; return; }
+  const head='<div class="mut" style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em">Archive</div>'
+    +'<div class="mut" style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;text-align:right">Entries</div>'
+    +'<div class="mut" style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;text-align:right">Content</div>'
+    +'<div class="mut" style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em">Scope</div><div></div>';
+  host.innerHTML=vols.map(v=>{
+    const inScope=v.archives.filter(a=>a.in_scope===true);
+    const bulk = v.connected
+      ? `<button class="btn btn-primary" data-vol="${esc(v.volume_id)}" data-bulk="1" ${inScope.length?'':'disabled'}>Enqueue all ${inScope.length} in scope</button>`
+      : '<span class="mut">drive not connected — no verdict</span>';
+    const rows=v.archives.length
+      ? v.archives.map(a=>archiveRow(Object.assign({_vol:v.volume_id},a))).join('')
+      : '<div class="mut" style="grid-column:1/-1">No archives catalogued on this drive.</div>';
+    return `<div class="card" style="margin-bottom:16px" data-vid="${esc(v.volume_id)}">
+      <div class="row" style="justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+        <h3 style="margin:0">${esc(v.label)}</h3>${bulk}
+      </div>
+      <div style="display:grid;grid-template-columns:minmax(0,2fr) max-content max-content max-content max-content;gap:6px 16px;align-items:baseline;font-size:12.5px">
+        ${head}${rows}
+      </div>
+    </div>`;
+  }).join('');
+
+  host.onclick = async e=>{
+    const b=e.target.closest('button'); if(!b || b.disabled) return;
+    const vol=vols.find(v=>v.volume_id===b.dataset.vol); if(!vol) return;
+    const paths = b.dataset.bulk
+      ? vol.archives.filter(a=>a.in_scope===true).map(a=>a.relative_path)
+      : [b.dataset.path];
+    if(!paths.length) return;
+    b.disabled=true;
+    try{
+      const out=await apiPost('/api/extract',{volume_id:vol.volume_id,paths});
+      // Refusals are shown, never swallowed: a skipped archive that looks like a success would leave
+      // the user believing content was unlocked when it was not.
+      $("#msg").textContent = out.refusals && out.refusals.length
+        ? out.queued+' queued, '+out.skipped+' refused: '+out.refusals.map(r=>r.path+' — '+r.reason).join('; ')
+        : out.queued+' archive'+(out.queued===1?'':'s')+' queued.';
+      poll();
+    }catch(e){
+      $("#msg").textContent = 'Could not queue: '+esc(String(e));
+      b.disabled=false;
+    }
+  };
+}
+
+// `seq` is monotonic and assigned once, so "newer than the highest seq already reported" is the
+// exact set of results this poll has not shown yet -- same technique as the Duplicates page.
+// Results accumulate into a small capped history instead of vanishing at the next tick, so a
+// result is still on screen if the reviewer looks a few seconds after it lands.
+let extractMaxSeqReported=-1, recentExtracts=[], extractWasBusy=false;
+async function poll(){
+  let s; try{ s=await apiGet('/api/quarantine/status'); }catch(e){ return; }
+  const running = s.running && s.running.kind==='extract' ? s.running : null;
+  const pending = s.pending.filter(j=>j.kind==='extract');
+  const fresh = s.recent.filter(r=>r.kind==='extract' && r.seq>extractMaxSeqReported);
+  if(fresh.length){
+    extractMaxSeqReported=Math.max(...fresh.map(r=>r.seq));
+    recentExtracts=fresh.concat(recentExtracts).slice(0,10);
+  }
+  const busy = !!running || pending.length>0;
+  const parts=[];
+  if(busy) parts.push('<b>'+(running?'Extracting '+esc(running.label):'Queued')+'</b>'
+    +(pending.length?' — '+pending.length+' more queued':''));
+  if(recentExtracts.length) parts.push('<ul style="margin:6px 0 0;padding-left:18px">'+recentExtracts.map(r=>
+    r.error_message
+      ? `<li style="color:var(--red)">${esc(r.label)}: ${esc(r.error_message)}</li>`
+      : `<li>${esc(r.label)}: ${fmtN(r.files_updated)} entries verified → ${esc(r.dest||'')}</li>`
+  ).join('')+'</ul>');
+  $("#queue").innerHTML=parts.join('');
+  $("#queue").hidden=parts.length===0;
+  // The verdict and the row's own Extract button go stale the moment its archive is done -- reload
+  // once the extract queue drains rather than on every tick, which would fight the reviewer's scroll
+  // position for no reason while a run is still in progress.
+  if(extractWasBusy && !busy) load();
+  extractWasBusy=busy;
+}
+
+load();
+poll();
+setInterval(poll,1500);
+"##;
+
+    shell("extract", csrf, "Extract", main, script)
+}
+
 pub fn scan_page(csrf: &str) -> String {
     let main = r##"
 <h1 class="page-h">Scan a Drive</h1>
@@ -1752,6 +1889,7 @@ mod tests {
             ("overview", super::overview_page("t")),
             ("browse", super::browse_page("t")),
             ("review", super::review_page("t")),
+            ("extract", super::extract_page("t")),
             ("drives", super::drives_page("t")),
             ("scan", super::scan_page("t")),
         ] {

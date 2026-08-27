@@ -94,6 +94,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/pending-formats", get(api_pending_formats))
         .route("/api/pending-formats/resolve", post(api_resolve_format))
         .route("/review", get(review))
+        .route("/extract", get(extract_page_h))
         .route("/scan", get(scan_page_h))
         .route("/drives", get(drives_page_h))
         .route("/console", get(console_page_h))
@@ -123,6 +124,10 @@ async fn browse(State(state): State<AppState>) -> Html<String> {
 
 async fn review(State(state): State<AppState>) -> Html<String> {
     Html(crate::web_ui::review_page(&state.csrf_token))
+}
+
+async fn extract_page_h(State(state): State<AppState>) -> Html<String> {
+    Html(crate::web_ui::extract_page(&state.csrf_token))
 }
 
 async fn scan_page_h(State(state): State<AppState>) -> Html<String> {

@@ -146,3 +146,17 @@ fn extract_endpoint_requires_csrf_token() {
         "a request without the CSRF token must be rejected before touching the queue: {body}"
     );
 }
+
+#[test]
+fn extract_page_renders_and_is_in_the_nav() {
+    let addr = start_server();
+    let body = http_get(addr, "/extract");
+    assert!(body.contains("200 OK"));
+    assert!(body.contains("Extract"), "page title present");
+    assert!(body.contains("href=\"/extract\""), "nav entry present");
+    let overview = http_get(addr, "/");
+    assert!(
+        overview.contains("href=\"/extract\""),
+        "nav is on every page"
+    );
+}
