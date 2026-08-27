@@ -209,13 +209,70 @@ pub fn scope_check_with_space(
     })
 }
 
+/// Zip slip guard shared by every archive format this extractor writes: a crafted entry name must
+/// never write outside the destination. Checked via `Path::components()` rather than ad-hoc string
+/// matching: `..`/`.`/empty segments are one case, but on Windows a drive-relative name like
+/// `C:evil.txt` has no `..` and is not `is_absolute()` either (a prefix with no root) -- yet
+/// `PathBuf::push` documents that joining such a path REPLACES the base rather than appending to
+/// it, so `dest_abs.join` would silently escape the destination entirely. Rejecting every
+/// component that is not `Component::Normal` catches `Prefix`, `RootDir`, `CurDir` and
+/// `ParentDir` uniformly, on both platforms. Entry names in both formats are `/`-separated by
+/// spec, so a literal `\` is a lying name regardless of what `components()` makes of it -- kept as
+/// an explicit check. An EMPTY name is also checked explicitly: `Path::new("").components()`
+/// yields no components at all, so `.all(..)` over it is vacuously true and would let an empty
+/// name through -- which `dest_abs.join("")` resolves to `dest_abs` itself, i.e. the extractor
+/// would try to write a file entry directly onto the destination directory.
+///
+/// Shared by `write_zip_level` and `write_7z_level` rather than duplicated: this check is a
+/// security boundary, and duplicated logic across a security boundary is how the two copies drift
+/// apart.
+fn entry_name_escapes(name: &str) -> bool {
+    name.is_empty()
+        || name.contains('\\')
+        || !Path::new(name)
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
 /// Write every file entry of ONE archive level into `dest_abs`, recreating the archive's own
 /// layout: a nested archive lands as a file, not as a folder. Returns the destination-relative
 /// paths written, so the caller can clean up precisely and verify what it asked for.
 ///
+/// Dispatches on the archive's own content signature -- the same content-based decision
+/// `archive::scan_level` makes when descending into it during a scan -- rather than trusting the
+/// filename: a renamed 7z is still a 7z, and the deny-list check upstream already decides whether
+/// an extension is extractable at all.
+///
 /// Any error leaves cleanup to the caller (`extract_archive` deletes the whole destination), which
-/// is why this function never tries to unwind half of its own work.
+/// is why neither format-specific function below ever tries to unwind half of its own work.
 pub fn write_level(
+    archive_path: &Path,
+    dest_abs: &Path,
+    limits: &crate::archive::ArchiveLimits,
+) -> anyhow::Result<Vec<String>> {
+    let mut head = [0u8; 6];
+    let filled = {
+        let mut f = std::fs::File::open(archive_path)?;
+        let mut filled = 0;
+        while filled < head.len() {
+            match f.read(&mut head[filled..])? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        filled
+    };
+    if crate::archive::looks_like_7z(&head[..filled]) {
+        write_7z_level(archive_path, dest_abs, limits)
+    } else {
+        write_zip_level(archive_path, dest_abs, limits)
+    }
+}
+
+/// The zip half of `write_level`'s contract. See `write_level`'s doc comment for the shared
+/// promises (zip-slip guard, `entry_max_bytes` on actual bytes read, returned paths in archive
+/// order, no partial-unwind cleanup).
+fn write_zip_level(
     archive_path: &Path,
     dest_abs: &Path,
     limits: &crate::archive::ArchiveLimits,
@@ -231,25 +288,7 @@ pub fn write_level(
         }
         let name = entry.name().to_string();
 
-        // Zip slip: a crafted name must never write outside the destination. Checked via
-        // `Path::components()` rather than ad-hoc string matching: `..`/`.`/empty segments are
-        // one case, but on Windows a drive-relative name like `C:evil.txt` has no `..` and is not
-        // `is_absolute()` either (a prefix with no root) -- yet `PathBuf::push` documents that
-        // joining such a path REPLACES the base rather than appending to it, so `dest_abs.join`
-        // would silently escape the destination entirely. Rejecting every component that is not
-        // `Component::Normal` catches `Prefix`, `RootDir`, `CurDir` and `ParentDir` uniformly, on
-        // both platforms. The zip spec defines entry names as `/`-separated, so a literal `\` is a
-        // lying name regardless of what `components()` makes of it -- kept as an explicit check.
-        // An EMPTY name is also checked explicitly: `Path::new("").components()` yields no
-        // components at all, so `.all(..)` over it is vacuously true and would let an empty name
-        // through -- which `dest_abs.join("")` resolves to `dest_abs` itself, i.e. the extractor
-        // would try to write a file entry directly onto the destination directory.
-        let escapes = name.is_empty()
-            || name.contains('\\')
-            || !Path::new(&name)
-                .components()
-                .all(|c| matches!(c, std::path::Component::Normal(_)));
-        if escapes {
+        if entry_name_escapes(&name) {
             anyhow::bail!("entry name escapes the destination folder: {name}");
         }
 
@@ -285,6 +324,78 @@ pub fn write_level(
         std::io::Write::flush(&mut out)?;
         written.push(name);
     }
+    Ok(written)
+}
+
+/// The 7z half of `write_level`'s contract. Same zip-slip guard and `entry_max_bytes` enforcement
+/// as `write_zip_level`, via the shared `entry_name_escapes` and the same cap-on-actual-bytes loop.
+///
+/// `ratio_cap` does NOT apply here -- see `ArchiveLimits::ratio_cap`'s doc comment: solid
+/// compression leaves `compressed_size` unfilled (0) for every entry but the first in each folder,
+/// so `entry_max_bytes`, enforced on the real decoded byte count as it streams through, is the
+/// sole guard for this format. `scan_7z_level` in `archive.rs` made and documented the identical
+/// decision for the read side; this is the same tradeoff on the write side.
+///
+/// Uses `sevenz_rust2::SevenZReader::for_each_entries`, the same streaming idiom
+/// `archive::scan_7z_level` established: each entry arrives as a live `&mut dyn Read`, decoded
+/// lazily as the closure reads it, so a guard failure mid-entry (zip-slip, size cap) can be
+/// surfaced as soon as it is detected without buffering the whole entry first.
+fn write_7z_level(
+    archive_path: &Path,
+    dest_abs: &Path,
+    limits: &crate::archive::ArchiveLimits,
+) -> anyhow::Result<Vec<String>> {
+    let file = std::fs::File::open(archive_path)?;
+    let mut archive = sevenz_rust2::SevenZReader::new(
+        std::io::BufReader::new(file),
+        sevenz_rust2::Password::empty(),
+    )?;
+    let cap = limits.entry_max_bytes.unwrap_or(u64::MAX);
+    let mut written = Vec::new();
+
+    archive.for_each_entries(|entry, r| {
+        if entry.is_directory {
+            return Ok(true);
+        }
+        let name = entry.name.clone();
+
+        if entry_name_escapes(&name) {
+            return Err(sevenz_rust2::Error::other(format!(
+                "entry name escapes the destination folder: {name}"
+            )));
+        }
+
+        let out_path = dest_abs.join(&name);
+        if let Some(p) = out_path.parent() {
+            std::fs::create_dir_all(p)
+                .map_err(|e| sevenz_rust2::Error::io_msg(e, "creating destination directory"))?;
+        }
+        let mut out = std::io::BufWriter::new(
+            std::fs::File::create(&out_path)
+                .map_err(|e| sevenz_rust2::Error::io_msg(e, "creating destination file"))?,
+        );
+        let mut buf = [0u8; 64 * 1024];
+        let mut total: u64 = 0;
+        loop {
+            let n = r.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            if total > cap {
+                return Err(sevenz_rust2::Error::other(format!(
+                    "entry {name} exceeds the size cap {cap} bytes"
+                )));
+            }
+            std::io::Write::write_all(&mut out, &buf[..n])
+                .map_err(|e| sevenz_rust2::Error::io_msg(e, "writing destination file"))?;
+        }
+        std::io::Write::flush(&mut out)
+            .map_err(|e| sevenz_rust2::Error::io_msg(e, "flushing destination file"))?;
+        written.push(name);
+        Ok(true)
+    })?;
+
     Ok(written)
 }
 
@@ -613,6 +724,20 @@ mod tests {
         zw.finish().unwrap();
     }
 
+    /// As `write_zip`, but a 7z, using the same `sevenz_rust2::SevenZWriter` idiom the crate's own
+    /// `archive.rs` test fixtures already established.
+    fn write_7z(path: &Path, files: &[(&str, &[u8])]) {
+        let mut sz = sevenz_rust2::SevenZWriter::create(path).unwrap();
+        for (name, bytes) in files {
+            sz.push_archive_entry(
+                sevenz_rust2::SevenZArchiveEntry::new_file(name),
+                Some(*bytes),
+            )
+            .unwrap();
+        }
+        sz.finish().unwrap();
+    }
+
     /// A catalogue that mirrors what a real scan produces for a small zip on a temp "drive": the
     /// archive itself catalogued as a loose file (as `scanner.rs` does via `upsert_file`), plus
     /// every entry inside it catalogued by running the real `archive::scan_archive` over the real
@@ -633,9 +758,30 @@ mod tests {
         archive_name: &str,
         files: &[(&str, &[u8])],
     ) -> (Catalog, std::path::PathBuf) {
+        real_scan_fixture_writing(tmp, archive_name, files, write_zip)
+    }
+
+    /// As `real_scan_fixture`, but for `bundle.7z`, built through the real `sevenz_rust2` writer --
+    /// so the hashes under test come from a genuine 7z, not a zip wearing a `.7z` name.
+    fn real_scan_fixture_7z(
+        tmp: &tempfile::TempDir,
+        files: &[(&str, &[u8])],
+    ) -> (Catalog, std::path::PathBuf) {
+        real_scan_fixture_writing(tmp, "bundle.7z", files, write_7z)
+    }
+
+    /// Shared body of `real_scan_fixture_named` and `real_scan_fixture_7z`: everything but writing
+    /// the archive's own bytes is identical between formats, so `write` -- `write_zip` or
+    /// `write_7z` -- is the only piece that differs.
+    fn real_scan_fixture_writing(
+        tmp: &tempfile::TempDir,
+        archive_name: &str,
+        files: &[(&str, &[u8])],
+        write: impl FnOnce(&Path, &[(&str, &[u8])]),
+    ) -> (Catalog, std::path::PathBuf) {
         std::fs::write(tmp.path().join(crate::volume::MARKER), "vol-1").unwrap();
         let archive_path = tmp.path().join(archive_name);
-        write_zip(&archive_path, files);
+        write(&archive_path, files);
 
         let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
         cat.upsert_volume(&crate::catalog::models::Volume {
@@ -745,6 +891,22 @@ mod tests {
             loose.is_some(),
             "extracted file is now a loose catalogue row"
         );
+    }
+
+    #[test]
+    fn a_7z_extracts_and_verifies_against_its_catalogued_hashes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cat, _) = real_scan_fixture_7z(&tmp, &[("a.txt", b"AAA")]);
+
+        let out =
+            extract_archive(&cat, tmp.path(), "vol-1", "bundle.7z", &test_limits(), 100).unwrap();
+
+        assert_eq!(out.entries_converted, 1);
+        assert_eq!(
+            std::fs::read(tmp.path().join("bundle/a.txt")).unwrap(),
+            b"AAA"
+        );
+        assert!(tmp.path().join("_ToDelete/bundle.7z").is_file());
     }
 
     #[test]
@@ -968,6 +1130,59 @@ mod tests {
         limits.entry_max_bytes = Some(1024);
 
         let err = write_level(&zip_path, &dest, &limits).unwrap_err();
+        assert!(
+            format!("{err}").contains("1024"),
+            "must report the cap: {err}"
+        );
+    }
+
+    #[test]
+    fn write_level_dispatches_to_7z_by_content_and_recreates_its_layout() {
+        // `write_level` is the content-based dispatcher (same idea as `archive::scan_level`): a
+        // `.7z` on disk, regardless of what write_zip_level would do with it, must come out through
+        // the 7z reader with the archive's own layout intact.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bundle.7z");
+        write_7z(&path, &[("a.txt", b"AAA"), ("sub/b.txt", b"BBB")]);
+        let dest = tmp.path().join("bundle");
+
+        let written = write_level(&path, &dest, &test_limits()).unwrap();
+
+        assert_eq!(written, vec!["a.txt".to_string(), "sub/b.txt".to_string()]);
+        assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"AAA");
+        assert_eq!(std::fs::read(dest.join("sub/b.txt")).unwrap(), b"BBB");
+    }
+
+    #[test]
+    fn write_level_refuses_a_7z_entry_that_escapes_the_destination() {
+        // Same zip-slip guard, proven against the 7z path: `write_7z_level` must reject exactly
+        // what `write_zip_level` rejects, via the shared `entry_name_escapes`.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("evil.7z");
+        write_7z(&path, &[("../escaped.txt", b"NOPE")]);
+        let dest = tmp.path().join("evil");
+
+        let err = write_level(&path, &dest, &test_limits()).unwrap_err();
+        assert!(format!("{err}").contains("escapes"), "got: {err}");
+        assert!(
+            !tmp.path().join("escaped.txt").exists(),
+            "zip-slip must write nothing"
+        );
+    }
+
+    #[test]
+    fn write_level_honours_the_entry_size_cap_for_7z() {
+        // `entry_max_bytes` is the SOLE guard for 7z (no ratio_cap pre-filter, see
+        // `ArchiveLimits::ratio_cap`'s doc comment), so it must be proven against the real
+        // `sevenz_rust2` streaming decoder, not inferred from the zip test of the same shape.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("big.7z");
+        write_7z(&path, &[("big.bin", &vec![7u8; 4096])]);
+        let dest = tmp.path().join("big");
+        let mut limits = test_limits();
+        limits.entry_max_bytes = Some(1024);
+
+        let err = write_level(&path, &dest, &limits).unwrap_err();
         assert!(
             format!("{err}").contains("1024"),
             "must report the cap: {err}"
