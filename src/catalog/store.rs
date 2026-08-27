@@ -818,6 +818,57 @@ impl Catalog {
         Ok(rows)
     }
 
+    /// Stream every active archived entry on this volume, grouped by its archive, without loading
+    /// them all into memory or issuing one query per archive.
+    ///
+    /// The archives-list page needs `(archive, chain, size)` for up to 1.7M entries at once (the
+    /// real catalogue). Fetching them per archive cost one query per archive plus one per entry;
+    /// materialising them all would cost hundreds of MB. Ordered by `(relative_path, id)` so the
+    /// caller can close out one archive's verdict before the next begins, and so that the order
+    /// within an archive matches `archive_entries` -- which is what keeps the bulk pass and the
+    /// single-archive check refusing for the same reason.
+    pub fn for_each_archived_entry(
+        &self,
+        volume_id: &str,
+        mut f: impl FnMut(&str, &str, i64) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let mut stmt = self.conn.prepare(
+            "SELECT relative_path, container_chain, size_bytes FROM files
+             WHERE volume_id=?1 AND container_chain IS NOT NULL AND status='active'
+             ORDER BY relative_path, id",
+        )?;
+        let mut rows = stmt.query(params![volume_id])?;
+        while let Some(r) = rows.next()? {
+            let archive: String = r.get(0)?;
+            let chain: String = r.get(1)?;
+            f(&archive, &chain, r.get(2)?)?;
+        }
+        Ok(())
+    }
+
+    /// Every loose path on this volume that lives under `dir`, whatever its status.
+    ///
+    /// One indexed range scan over `idx_files_loose_identity` instead of one `loose_path_taken`
+    /// per archive entry. Every path an extraction of `dir`'s archive could write starts with
+    /// `dir/`, so this set is a superset of the collisions -- the caller still compares exact
+    /// paths, and the answer is identical to asking row by row.
+    pub fn loose_paths_under(
+        &self,
+        volume_id: &str,
+        dir: &str,
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        // '/' is 0x2F and '0' is 0x30, so [dir/, dir0) is exactly "everything under dir/".
+        let lo = format!("{dir}/");
+        let hi = format!("{dir}0");
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT relative_path FROM files
+             WHERE volume_id=?1 AND container_chain IS NULL
+               AND relative_path >= ?2 AND relative_path < ?3",
+        )?;
+        let rows = stmt.query_map(params![volume_id, lo, hi], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<std::collections::HashSet<_>, _>>()?)
+    }
+
     /// Every archive on this volume that still has active catalogued entries, one row per archive
     /// with the entry count and total uncompressed size extracting it would need.
     pub fn archive_roots(&self, volume_id: &str) -> anyhow::Result<Vec<ArchiveRoot>> {
