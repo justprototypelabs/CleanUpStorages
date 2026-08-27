@@ -18,8 +18,17 @@ pub struct ArchiveLimits {
     /// CATALOGUE: the largest leaf file we will record. `None` is unlimited, and safe: leaves are
     /// stream-hashed in 64 KiB chunks, so their size costs no memory.
     pub entry_max_bytes: Option<u64>,
-    /// TIME: declared uncompressed/compressed. With a generous leaf ceiling this is what stops a
-    /// genuine bomb streaming for a long time before its size cap trips.
+    /// TIME, for zip only: declared uncompressed/compressed. With a generous leaf ceiling this is
+    /// what stops a genuine zip bomb streaming for a long time before its size cap trips.
+    ///
+    /// Does NOT apply to 7z. A per-entry compressed size is only reliable for the first file in
+    /// each solid-compression folder -- every other entry in that folder reads back a declared
+    /// `compressed_size` of 0, which a ratio computed from it would either divide-by-a-bogus-1 or
+    /// have to skip outright, and ordinary multi-file `.7z` archives are usually solid, so skipping
+    /// is what happens in practice for nearly every entry. See the skip site in `scan_7z_level` for
+    /// the coarser (folder-level) check that was available instead and was not taken. For 7z,
+    /// `entry_max_bytes` is therefore the SOLE guard: a pathological entry can be streamed and
+    /// decompressed all the way up to that ceiling (64 GiB by default) before being rejected.
     pub ratio_cap: u64,
     /// Zip-format extensions always treated as a leaf, never descended -- checked first and always
     /// wins, including over `zip` itself.
@@ -547,7 +556,20 @@ fn scan_7z_level<R: Read + Seek>(
         // from that would be wrong for nearly every entry in an ordinary multi-file .7z. So the
         // real guard here is `entry_max_bytes`, enforced on the actual decompressed byte count as
         // it streams through `handle_entry`'s leaf path below -- the same protection `hash_capped`
-        // already gives every format against a header that lies about its size.
+        // already gives every format against a header that lies about its size. See `ratio_cap`'s
+        // doc comment on `ArchiveLimits` for what this means in practice: a pathological 7z entry
+        // can stream all the way up to `entry_max_bytes` before being rejected.
+        //
+        // A coarser guard WAS available and was deliberately not taken: `sevenz_rust2::Archive`
+        // (lower-level than the `SevenZReader::for_each_entries` streaming API used here) exposes
+        // `folders`, `pack_sizes`, `is_solid`, and a `stream_map`, from which a FOLDER-level ratio
+        // (total pack size vs. total unpack size of the folder an entry belongs to) could be
+        // precomputed before decoding. That would catch a bomb one solid-compression block at a
+        // time rather than per file. It was not built here because it means walking a second, lower-
+        // level API alongside the streaming one just for this pre-check, trading away the shared
+        // `handle_entry` path's simplicity for a coarser guard, for a format currently worth 5 files
+        // and ~400 MB of the user's own (non-adversarial) data. If 7z's threat model changes -- more
+        // files, an untrusted source -- this is the route to tighten it.
         let (head, is_zip, is_7z) = match peek6(r) {
             Ok(v) => v,
             Err(e) => {
@@ -1129,6 +1151,37 @@ mod tests {
             .unwrap();
         assert_eq!(a.content_hash, blake3::hash(b"AAA").to_hex().to_string());
         assert_eq!(a.size_bytes, 3);
+    }
+
+    /// Directed test for the finding in the Task 10 review: with no ratio-cap pre-filter for 7z,
+    /// `entry_max_bytes` is the SOLE guard against a pathological entry, so it must be proven
+    /// against the real `sevenz_rust2` streaming decoder rather than inferred from the zip test of
+    /// the same shape (`rejects_oversized_entry` above). Mirrors that test's structure exactly.
+    #[test]
+    fn rejects_an_oversized_7z_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("big.7z");
+        write_7z(&path, &[("big.bin", b"0123456789")]);
+        let small = ArchiveLimits {
+            entry_max_bytes: Some(4),
+            ..limits()
+        };
+
+        let f = std::fs::File::open(&path).unwrap();
+        let res = scan_archive(std::io::BufReader::new(f), &small);
+
+        assert!(
+            res.entries.is_empty(),
+            "must not be catalogued: {:?}",
+            res.entries
+        );
+        assert_eq!(res.errors.len(), 1);
+        assert!(
+            res.errors[0].1.contains("zip bomb"),
+            "entry_max_bytes must actually trip against the real decoded stream, not a declared \
+             size: reason was {:?}",
+            res.errors[0].1
+        );
     }
 
     #[test]
