@@ -157,56 +157,167 @@ pub fn scope_check_with_space(
     free_bytes: Option<u64>,
 ) -> anyhow::Result<Scope> {
     let entries = cat.archive_entries(volume_id, archive_rel)?;
-    if entries.is_empty() {
-        return Ok(Scope::Refused(
-            "no catalogued entries: nothing to verify an extraction against".into(),
-        ));
-    }
-
+    let mut acc = ScopeAcc::default();
     for e in &entries {
         let chain = e.container_chain.as_deref().unwrap_or_default();
+        // A purged or quarantined row can still own the loose path this entry would take.
+        let taken = cat.loose_path_taken(volume_id, &final_relative_path(archive_rel, chain))?;
+        acc.entry(Some(mount_root), archive_rel, chain, e.size_bytes, taken);
+    }
+    Ok(acc.finish(mount_root, archive_rel, free_bytes))
+}
+
+/// The refusal rules for ONE archive, fed one entry at a time.
+///
+/// Both the single-archive check and the whole-volume pass drive this, so the Extract page cannot
+/// promise something the worker will refuse: there is one implementation of the rules, and the two
+/// callers differ only in how they obtain the entries and the loose-path answer.
+#[derive(Default)]
+struct ScopeAcc {
+    entries: usize,
+    uncompressed: i64,
+    /// The FIRST refusal seen, kept so the reported reason does not depend on how far the scan got.
+    refusal: Option<String>,
+}
+
+impl ScopeAcc {
+    /// `taken` is "the catalogue already holds a loose row at this entry's target path".
+    fn entry(
+        &mut self,
+        mount_root: Option<&Path>,
+        archive_rel: &str,
+        chain: &str,
+        size_bytes: i64,
+        taken: bool,
+    ) {
+        self.entries += 1;
+        self.uncompressed += size_bytes;
+        // Both refusals below are measured against the mount: the path budget counts the mount
+        // root's own characters, and a collision only matters for a drive we can write to.
+        let Some(mount_root) = mount_root else { return };
+        if self.refusal.is_some() {
+            return;
+        }
         if !fits_budget(mount_root, archive_rel, chain) {
             let n = full_length(mount_root, archive_rel, chain);
-            return Ok(Scope::Refused(format!(
+            self.refusal = Some(format!(
                 "entry would need {n} characters, over the {MAX_PATH_CHARS} limit: {chain}"
-            )));
+            ));
+            return;
         }
-        // A purged or quarantined row can still own the loose path this entry would take.
-        let target = final_relative_path(archive_rel, chain);
-        if cat.loose_path_taken(volume_id, &target)? {
-            return Ok(Scope::Refused(format!(
+        if taken {
+            let target = final_relative_path(archive_rel, chain);
+            self.refusal = Some(format!(
                 "the catalogue already has a loose file at {target}"
-            )));
-        }
-    }
-
-    let dest = destination_dir(archive_rel);
-    if mount_root.join(&dest).exists() {
-        return Ok(Scope::Refused(format!(
-            "destination folder {dest} already exists; refusing to merge into it"
-        )));
-    }
-
-    let uncompressed: i64 = entries.iter().map(|e| e.size_bytes).sum();
-    let required = uncompressed as u64 + SPACE_HEADROOM_BYTES;
-    match free_bytes {
-        Some(free) if free < required => {
-            return Ok(Scope::Refused(format!(
-                "needs {required} bytes free (content {uncompressed} + 5 GiB headroom), {free} available"
-            )));
-        }
-        Some(_) => {}
-        None => {
-            return Ok(Scope::Refused(
-                "could not determine free space on the drive; refusing rather than guessing".into(),
             ));
         }
     }
 
-    Ok(Scope::InScope {
-        entries: entries.len(),
-        uncompressed_bytes: uncompressed,
-    })
+    fn finish(self, mount_root: &Path, archive_rel: &str, free_bytes: Option<u64>) -> Scope {
+        if self.entries == 0 {
+            return Scope::Refused(
+                "no catalogued entries: nothing to verify an extraction against".into(),
+            );
+        }
+        if let Some(r) = self.refusal {
+            return Scope::Refused(r);
+        }
+        let dest = destination_dir(archive_rel);
+        if mount_root.join(&dest).exists() {
+            return Scope::Refused(format!(
+                "destination folder {dest} already exists; refusing to merge into it"
+            ));
+        }
+        let uncompressed = self.uncompressed;
+        let required = uncompressed as u64 + SPACE_HEADROOM_BYTES;
+        match free_bytes {
+            Some(free) if free < required => Scope::Refused(format!(
+                "needs {required} bytes free (content {uncompressed} + 5 GiB headroom), {free} available"
+            )),
+            Some(_) => Scope::InScope {
+                entries: self.entries,
+                uncompressed_bytes: uncompressed,
+            },
+            None => Scope::Refused(
+                "could not determine free space on the drive; refusing rather than guessing".into(),
+            ),
+        }
+    }
+}
+
+/// One archive as the archives-list page needs it: how big extracting it would be, and -- when the
+/// drive is connected -- whether it may be extracted at all.
+pub struct ArchiveScope {
+    pub relative_path: String,
+    pub entries: usize,
+    pub uncompressed_bytes: i64,
+    /// `None` when the drive is not mounted: the checks stat the destination and read free space,
+    /// so with no drive there is no verdict to give -- not a refusal, an absence.
+    pub scope: Option<Scope>,
+}
+
+/// Every archive on one volume, with the same verdict [`scope_check_with_space`] would give, in a
+/// number of queries proportional to the ARCHIVES rather than to their entries.
+///
+/// The per-archive check costs one query per archive plus one `loose_path_taken` per entry. On the
+/// real catalogue that is 1,805 archives holding 1,714,645 entries: measured at ~1 ms each, the
+/// archives page took roughly half an hour to answer one request, which read as a page that never
+/// loads. This pass streams the entries once, ordered by archive, and asks for the loose paths
+/// under each destination in one indexed range scan.
+///
+/// It also returns the per-archive counts, so the page needs no second `archive_roots` pass over
+/// the same 1.7M rows. Sorted biggest-content-first, the order `archive_roots` produced.
+pub fn archive_scopes(
+    cat: &Catalog,
+    mount_root: Option<&Path>,
+    volume_id: &str,
+    free_bytes: Option<u64>,
+) -> anyhow::Result<Vec<ArchiveScope>> {
+    let mut out: Vec<ArchiveScope> = Vec::new();
+    // The archive being accumulated: its path, its verdict so far, and the loose paths already
+    // under its destination (usually empty, fetched once per archive rather than once per entry).
+    let mut current: Option<(String, ScopeAcc, std::collections::HashSet<String>)> = None;
+    let close = |out: &mut Vec<ArchiveScope>, path: String, acc: ScopeAcc| {
+        let (entries, uncompressed_bytes) = (acc.entries, acc.uncompressed);
+        let scope = mount_root.map(|m| acc.finish(m, &path, free_bytes));
+        out.push(ArchiveScope {
+            relative_path: path,
+            entries,
+            uncompressed_bytes,
+            scope,
+        });
+    };
+
+    cat.for_each_archived_entry(volume_id, |archive_rel, chain, size_bytes| {
+        let fresh = match &current {
+            Some((path, _, _)) => path != archive_rel,
+            None => true,
+        };
+        if fresh {
+            if let Some((path, acc, _)) = current.take() {
+                close(&mut out, path, acc);
+            }
+            let loose = match mount_root {
+                Some(_) => cat.loose_paths_under(volume_id, &destination_dir(archive_rel))?,
+                // With no drive there is no verdict, so the collision lookup is not worth its query.
+                None => std::collections::HashSet::new(),
+            };
+            current = Some((archive_rel.to_string(), ScopeAcc::default(), loose));
+        }
+        let (path, acc, loose) = current.as_mut().expect("just set");
+        let taken = loose.contains(&final_relative_path(path, chain));
+        acc.entry(mount_root, path, chain, size_bytes, taken);
+        Ok(())
+    })?;
+    if let Some((path, acc, _)) = current {
+        close(&mut out, path, acc);
+    }
+    out.sort_by(|a, b| {
+        b.uncompressed_bytes
+            .cmp(&a.uncompressed_bytes)
+            .then_with(|| a.relative_path.cmp(&b.relative_path))
+    });
+    Ok(out)
 }
 
 /// Zip slip guard shared by every archive format this extractor writes: a crafted entry name must
@@ -1512,6 +1623,191 @@ mod tests {
             .unwrap();
         }
         cat
+    }
+
+    /// The bulk pass keyed by archive, so a test can compare one archive at a time.
+    fn scopes_by_archive(
+        cat: &Catalog,
+        mount_root: &std::path::Path,
+        free: Option<u64>,
+    ) -> std::collections::HashMap<String, Scope> {
+        archive_scopes(cat, Some(mount_root), "vol-1", free)
+            .unwrap()
+            .into_iter()
+            .map(|a| {
+                (
+                    a.relative_path,
+                    a.scope.expect("mounted, so it has a verdict"),
+                )
+            })
+            .collect()
+    }
+
+    /// One loose row, enough to own a path the way a real file would.
+    fn loose_file(relative_path: &str) -> crate::catalog::models::NewFile {
+        crate::catalog::models::NewFile {
+            volume_id: "vol-1".into(),
+            relative_path: relative_path.into(),
+            filename: relative_path.rsplit('/').next().unwrap().into(),
+            extension: "txt".into(),
+            size_bytes: 4,
+            content_hash: "other".into(),
+            created_time: None,
+            modified_time: None,
+            accessed_time: None,
+            category: crate::category::Category::Other,
+            container_chain: None,
+        }
+    }
+
+    /// Catalogue several archives on one volume, so the bulk pass has groups to close out.
+    fn catalog_with_archives(
+        tmp: &tempfile::TempDir,
+        archives: &[(&str, &[(&str, i64)])],
+    ) -> Catalog {
+        std::fs::write(tmp.path().join(crate::volume::MARKER), "vol-1").unwrap();
+        let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
+        cat.upsert_volume(&crate::catalog::models::Volume {
+            volume_id: "vol-1".into(),
+            label: "T".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+        for (archive, entries) in archives {
+            for (chain, size) in *entries {
+                cat.upsert_archive_entry(
+                    "vol-1",
+                    archive,
+                    &crate::archive::ArchiveEntry {
+                        container_chain: (*chain).to_string(),
+                        filename: chain.rsplit('/').next().unwrap().to_string(),
+                        extension: "txt".into(),
+                        size_bytes: *size,
+                        content_hash: format!("h-{archive}-{chain}"),
+                    },
+                    None,
+                    1,
+                )
+                .unwrap();
+            }
+        }
+        cat
+    }
+
+    /// The archives page and the worker must never disagree about what can be extracted, so the
+    /// whole-volume pass is checked against the per-archive one on every refusal branch.
+    #[test]
+    fn the_bulk_volume_pass_agrees_with_the_per_archive_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let long = format!("{}/x.txt", "d".repeat(300));
+        let cat = catalog_with_archives(
+            &tmp,
+            &[
+                ("ok.zip", &[("small.txt", 4)]),
+                ("long.zip", &[(long.as_str(), 4)]),
+                ("taken.zip", &[("dup.txt", 4)]),
+                ("exists.zip", &[("a.txt", 4)]),
+            ],
+        );
+        // `taken.zip` would extract to `taken/dup.txt`, and the catalogue already owns that path.
+        cat.upsert_file(&loose_file("taken/dup.txt"), 1).unwrap();
+        // `exists.zip`'s destination folder is already on disk.
+        std::fs::create_dir_all(tmp.path().join("exists")).unwrap();
+
+        let free = Some(u64::MAX / 2);
+        let bulk = scopes_by_archive(&cat, tmp.path(), free);
+        assert_eq!(bulk.len(), 4, "every archive gets a verdict");
+        for archive in ["ok.zip", "long.zip", "taken.zip", "exists.zip"] {
+            let one = scope_check_with_space(&cat, tmp.path(), "vol-1", archive, free).unwrap();
+            let many = bulk.get(archive).expect("archive missing from bulk pass");
+            match (&one, &many) {
+                (
+                    Scope::InScope {
+                        entries: a,
+                        uncompressed_bytes: ab,
+                    },
+                    Scope::InScope {
+                        entries: b,
+                        uncompressed_bytes: bb,
+                    },
+                ) => assert_eq!((a, ab), (b, bb), "{archive}"),
+                (Scope::Refused(a), Scope::Refused(b)) => {
+                    assert_eq!(
+                        a, b,
+                        "{archive}: the two paths must refuse for the same reason"
+                    )
+                }
+                _ => panic!("{archive}: the two checks disagree"),
+            }
+        }
+        assert!(matches!(bulk["ok.zip"], Scope::InScope { .. }));
+        assert!(matches!(bulk["long.zip"], Scope::Refused(_)));
+    }
+
+    /// With no drive attached the page still lists the archives and their sizes -- it just has no
+    /// verdict to give, which is an absence rather than a refusal.
+    #[test]
+    fn an_unmounted_volume_still_reports_counts_but_no_verdict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cat = catalog_with_archives(
+            &tmp,
+            &[
+                ("small.zip", &[("a.txt", 4)]),
+                ("big.zip", &[("b.txt", 40), ("c.txt", 2)]),
+            ],
+        );
+        let all = archive_scopes(&cat, None, "vol-1", None).unwrap();
+        assert_eq!(all.len(), 2);
+        // Biggest content first, the order the list page renders.
+        assert_eq!(all[0].relative_path, "big.zip");
+        assert_eq!(all[0].entries, 2);
+        assert_eq!(all[0].uncompressed_bytes, 42);
+        assert!(all[0].scope.is_none(), "no drive, no verdict");
+        assert_eq!(all[1].relative_path, "small.zip");
+        assert_eq!(all[1].uncompressed_bytes, 4);
+    }
+
+    /// A refusal must not depend on how far the scan happened to get before it hit one.
+    #[test]
+    fn the_bulk_pass_reports_the_first_refusal_not_the_last() {
+        let tmp = tempfile::tempdir().unwrap();
+        let long = format!("{}/x.txt", "d".repeat(300));
+        let cat = catalog_with_archives(
+            &tmp,
+            &[(
+                "mixed.zip",
+                &[("a.txt", 4), (long.as_str(), 4), ("b.txt", 4)],
+            )],
+        );
+        let free = Some(u64::MAX / 2);
+        let bulk = scopes_by_archive(&cat, tmp.path(), free);
+        let one = scope_check_with_space(&cat, tmp.path(), "vol-1", "mixed.zip", free).unwrap();
+        match (bulk.get("mixed.zip").unwrap(), &one) {
+            (Scope::Refused(a), Scope::Refused(b)) => assert_eq!(a, b, "same refusal"),
+            _ => panic!("both must refuse the over-long entry"),
+        }
+    }
+
+    /// A loose row that is NOT one of the extraction's target paths must not refuse the archive:
+    /// the range scan is a superset, and the exact comparison is what decides.
+    #[test]
+    fn an_unrelated_loose_file_under_the_destination_does_not_refuse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cat = catalog_with_archives(&tmp, &[("ok.zip", &[("wanted.txt", 4)])]);
+        cat.upsert_file(&loose_file("ok/unrelated.txt"), 1).unwrap();
+        let free = Some(u64::MAX / 2);
+        let bulk = scopes_by_archive(&cat, tmp.path(), free);
+        let one = scope_check_with_space(&cat, tmp.path(), "vol-1", "ok.zip", free).unwrap();
+        assert!(
+            matches!(one, Scope::InScope { .. }),
+            "per-archive check allows it"
+        );
+        assert!(
+            matches!(bulk["ok.zip"], Scope::InScope { .. }),
+            "the bulk pass must agree, not refuse on a prefix match"
+        );
     }
 
     #[test]

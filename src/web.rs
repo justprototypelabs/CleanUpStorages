@@ -1154,33 +1154,34 @@ async fn api_archives(
         // in one request. Re-enumerating per archive turned one page load into that many
         // sequential disk scans.
         let free_bytes = mount.and_then(|m| crate::repack::available_space(m));
-        let mut archives = Vec::new();
-        for root in cat.archive_roots(&volume_id).map_err(err500)? {
-            let (in_scope, reason) = match mount {
+        // ONE pass for the whole volume, not one check per archive, and not a second `archive_roots`
+        // scan for the counts. The per-archive check costs a `loose_path_taken` query per ENTRY, and
+        // the real catalogue holds 1,714,645 entries across 1,805 archives -- measured at ~1 ms
+        // each, this single request took about half an hour, which is what "the Extract page never
+        // loads" actually was.
+        let archives = crate::extract::archive_scopes(
+            &cat,
+            mount.map(|m| m.as_path()),
+            &volume_id,
+            free_bytes,
+        )
+        .map_err(err500)?
+        .into_iter()
+        .map(|a| {
+            let (in_scope, reason) = match a.scope {
                 None => (None, None),
-                Some(m) => {
-                    match crate::extract::scope_check_with_space(
-                        &cat,
-                        m,
-                        &volume_id,
-                        &root.relative_path,
-                        free_bytes,
-                    )
-                    .map_err(err500)?
-                    {
-                        crate::extract::Scope::InScope { .. } => (Some(true), None),
-                        crate::extract::Scope::Refused(r) => (Some(false), Some(r)),
-                    }
-                }
+                Some(crate::extract::Scope::InScope { .. }) => (Some(true), None),
+                Some(crate::extract::Scope::Refused(r)) => (Some(false), Some(r)),
             };
-            archives.push(ArchiveDto {
-                relative_path: root.relative_path,
-                entries: root.entries,
-                uncompressed_bytes: root.uncompressed_bytes,
+            ArchiveDto {
+                relative_path: a.relative_path,
+                entries: a.entries as i64,
+                uncompressed_bytes: a.uncompressed_bytes,
                 in_scope,
                 reason,
-            });
-        }
+            }
+        })
+        .collect();
         out.push(ArchiveVolumeDto {
             label: labels
                 .get(&volume_id)
