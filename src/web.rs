@@ -1142,6 +1142,11 @@ async fn api_archives(
 ) -> Result<Json<Vec<ArchiveVolumeDto>>, (StatusCode, String)> {
     let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
     let mounts = state.mounts.snapshot();
+    // The same limits the extraction worker builds (`quarantine_queue`), so the page's idea of what
+    // is extractable is the worker's idea, deny list and allow list included.
+    let limits = crate::archive::ArchiveLimits::from_config(
+        &crate::config::Config::default_paths().map_err(err500)?,
+    );
     // `effective_labels`, not `volume_stats`'s own label column: same reasoning as
     // `api_tree_duplicates` above -- the custom name set on the Drives page is what disambiguates
     // two drives that were both first seen as `D:\`.
@@ -1164,6 +1169,7 @@ async fn api_archives(
             mount.map(|m| m.as_path()),
             &volume_id,
             free_bytes,
+            &limits,
         )
         .map_err(err500)?
         .into_iter()
@@ -4196,6 +4202,95 @@ mod tests {
                 None => std::env::remove_var("CLEANUPSTORAGES_DATA_DIR"),
             }
         }
+    }
+
+    /// The Extract page lists what the extraction worker will actually accept. A `.pptx` with
+    /// catalogued entries -- rows a scan wrote before `pptx` was deny-listed -- is a normal file,
+    /// not an offer, and must not appear: clicking it would only earn "pptx is not an extractable
+    /// archive format on this configuration" from the worker.
+    #[tokio::test]
+    async fn the_archives_list_offers_only_extractable_formats() {
+        let _scope = ScopedDataDir::new();
+        let (_tmp, db) = catalogue_with_a_zip_and_a_pptx();
+
+        let listed = archives_listed(&db).await;
+
+        assert_eq!(listed, vec!["bundle.zip".to_string()]);
+    }
+
+    /// The policy is the user's, not a constant: an allow-listed extension is offered, which is
+    /// only true if the handler reads the same `settings.json` the extraction worker reads.
+    ///
+    /// `bak`, not `pptx`: the deny list is checked first and always wins (see `descent_for`), so
+    /// allow-listing a deny-listed extension would change nothing and prove nothing.
+    #[tokio::test]
+    async fn an_allow_listed_extension_is_offered_on_the_archives_list() {
+        let scope = ScopedDataDir::new();
+        std::fs::write(
+            scope.path().join("settings.json"),
+            r#"{"archive_allow_extensions":["bak"]}"#,
+        )
+        .unwrap();
+        let (_tmp, db) = catalogue_with_archives(&["bundle.zip", "renamed.bak"]);
+
+        let listed = archives_listed(&db).await;
+
+        assert_eq!(
+            listed,
+            vec!["bundle.zip".to_string(), "renamed.bak".to_string()]
+        );
+    }
+
+    /// One volume holding two catalogued archives of the same size: a real zip and a `.pptx` whose
+    /// entry rows an older scan wrote before the deny list existed.
+    fn catalogue_with_a_zip_and_a_pptx() -> (tempfile::TempDir, PathBuf) {
+        catalogue_with_archives(&["bundle.zip", "deck.pptx"])
+    }
+
+    /// A volume whose only catalogued content is one entry inside each named archive, all the same
+    /// size -- so the page's biggest-first order falls back to the path, and the assertions read as
+    /// written.
+    fn catalogue_with_archives(archives: &[&str]) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("c.db");
+        let cat = crate::catalog::Catalog::open(&db).unwrap();
+        cat.upsert_volume(&crate::catalog::models::Volume {
+            volume_id: "vol-1".into(),
+            label: "T".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+        for archive in archives {
+            cat.upsert_archive_entry(
+                "vol-1",
+                archive,
+                &crate::archive::ArchiveEntry {
+                    container_chain: "inside.txt".into(),
+                    filename: "inside.txt".into(),
+                    extension: "txt".into(),
+                    size_bytes: 4,
+                    content_hash: format!("h-{archive}"),
+                },
+                None,
+                1,
+            )
+            .unwrap();
+        }
+        drop(cat);
+        (tmp, db)
+    }
+
+    /// The archive paths `/api/archives` offers for the one seeded volume, in the order rendered.
+    async fn archives_listed(db: &std::path::Path) -> Vec<String> {
+        let v = get_json(db, "/api/archives").await;
+        v[0]["archives"]
+            .as_array()
+            .unwrap_or_else(|| panic!("one volume with an archives array: {v}"))
+            .iter()
+            .map(|a| a["relative_path"].as_str().unwrap().to_string())
+            .collect()
     }
 
     #[tokio::test]

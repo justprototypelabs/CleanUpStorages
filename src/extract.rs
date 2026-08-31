@@ -245,6 +245,33 @@ impl ScopeAcc {
     }
 }
 
+/// Whether this path names a format this configuration extracts at all -- zip, 7z, or an
+/// allow-listed extension.
+///
+/// The list page and the worker both ask this one function, so they cannot disagree: an archive the
+/// page offers is one `extract_archive` will accept, and everything else is a normal file to both.
+pub fn is_extractable(archive_rel: &str, limits: &crate::archive::ArchiveLimits) -> bool {
+    matches!(
+        crate::archive::descent_for(
+            &extension_of(archive_rel),
+            &limits.deny_extensions,
+            &limits.allow_extensions
+        ),
+        crate::archive::Descent::Descend
+    )
+}
+
+/// The lowercase, dot-free extension of a catalogue path, "" when it has none -- the form
+/// `descent_for` documents that it requires.
+fn extension_of(archive_rel: &str) -> String {
+    archive_rel
+        .rsplit('/')
+        .next()
+        .and_then(|l| l.rsplit_once('.'))
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
 /// One archive as the archives-list page needs it: how big extracting it would be, and -- when the
 /// drive is connected -- whether it may be extracted at all.
 pub struct ArchiveScope {
@@ -267,16 +294,28 @@ pub struct ArchiveScope {
 ///
 /// It also returns the per-archive counts, so the page needs no second `archive_roots` pass over
 /// the same 1.7M rows. Sorted biggest-content-first, the order `archive_roots` produced.
+///
+/// Only formats [`crate::archive::descent_for`] calls `Descend` are listed -- zip, 7z, and whatever
+/// the user allow-listed. Having catalogued entries is NOT the same question: the entries outlive
+/// the policy that produced them, so a `.pptx` descended by a scan predating the deny list still
+/// has rows today, and listing it would offer an extraction `extract_archive` refuses ("pptx is not
+/// an extractable archive format on this configuration") after the user has clicked. One rule, read
+/// from the same `limits` the worker uses, so the page cannot promise what the worker will refuse.
+/// Anything else is a normal file, and is left to be exactly that.
 pub fn archive_scopes(
     cat: &Catalog,
     mount_root: Option<&Path>,
     volume_id: &str,
     free_bytes: Option<u64>,
+    limits: &crate::archive::ArchiveLimits,
 ) -> anyhow::Result<Vec<ArchiveScope>> {
     let mut out: Vec<ArchiveScope> = Vec::new();
     // The archive being accumulated: its path, its verdict so far, and the loose paths already
     // under its destination (usually empty, fetched once per archive rather than once per entry).
+    // `None` while streaming past an archive no format policy would extract -- its entries are
+    // skipped without the per-archive loose-path query, which is the expensive part.
     let mut current: Option<(String, ScopeAcc, std::collections::HashSet<String>)> = None;
+    let mut skipping: Option<String> = None;
     let close = |out: &mut Vec<ArchiveScope>, path: String, acc: ScopeAcc| {
         let (entries, uncompressed_bytes) = (acc.entries, acc.uncompressed);
         let scope = mount_root.map(|m| acc.finish(m, &path, free_bytes));
@@ -289,13 +328,19 @@ pub fn archive_scopes(
     };
 
     cat.for_each_archived_entry(volume_id, |archive_rel, chain, size_bytes| {
-        let fresh = match &current {
-            Some((path, _, _)) => path != archive_rel,
-            None => true,
+        let fresh = match (&current, &skipping) {
+            (Some((path, _, _)), _) => path != archive_rel,
+            (None, Some(path)) => path != archive_rel,
+            (None, None) => true,
         };
         if fresh {
             if let Some((path, acc, _)) = current.take() {
                 close(&mut out, path, acc);
+            }
+            skipping = None;
+            if !is_extractable(archive_rel, limits) {
+                skipping = Some(archive_rel.to_string());
+                return Ok(());
             }
             let loose = match mount_root {
                 Some(_) => cat.loose_paths_under(volume_id, &destination_dir(archive_rel))?,
@@ -303,6 +348,9 @@ pub fn archive_scopes(
                 None => std::collections::HashSet::new(),
             };
             current = Some((archive_rel.to_string(), ScopeAcc::default(), loose));
+        }
+        if skipping.is_some() {
+            return Ok(());
         }
         let (path, acc, loose) = current.as_mut().expect("just set");
         let taken = loose.contains(&final_relative_path(path, chain));
@@ -680,19 +728,13 @@ pub fn extract_archive(
         ),
     }
 
-    // 2. The deny list decides what is an archive at all. A .docx is a zip, and exploding one
-    // destroys the document.
-    let ext = archive_rel
-        .rsplit('/')
-        .next()
-        .and_then(|l| l.rsplit_once('.'))
-        .map(|(_, e)| e.to_ascii_lowercase())
-        .unwrap_or_default();
-    if !matches!(
-        crate::archive::descent_for(&ext, &limits.deny_extensions, &limits.allow_extensions),
-        crate::archive::Descent::Descend
-    ) {
-        anyhow::bail!("{ext} is not an extractable archive format on this configuration");
+    // 2. The format policy decides what is an archive at all -- the same `is_extractable` the list
+    // page filters by. A .docx is a zip, and exploding one destroys the document.
+    if !is_extractable(archive_rel, limits) {
+        anyhow::bail!(
+            "{} is not an extractable archive format on this configuration",
+            extension_of(archive_rel)
+        );
     }
 
     let archive_path = mount_root.join(archive_rel);
@@ -1631,7 +1673,7 @@ mod tests {
         mount_root: &std::path::Path,
         free: Option<u64>,
     ) -> std::collections::HashMap<String, Scope> {
-        archive_scopes(cat, Some(mount_root), "vol-1", free)
+        archive_scopes(cat, Some(mount_root), "vol-1", free, &test_limits())
             .unwrap()
             .into_iter()
             .map(|a| {
@@ -1758,7 +1800,7 @@ mod tests {
                 ("big.zip", &[("b.txt", 40), ("c.txt", 2)]),
             ],
         );
-        let all = archive_scopes(&cat, None, "vol-1", None).unwrap();
+        let all = archive_scopes(&cat, None, "vol-1", None, &test_limits()).unwrap();
         assert_eq!(all.len(), 2);
         // Biggest content first, the order the list page renders.
         assert_eq!(all[0].relative_path, "big.zip");
@@ -1767,6 +1809,30 @@ mod tests {
         assert!(all[0].scope.is_none(), "no drive, no verdict");
         assert_eq!(all[1].relative_path, "small.zip");
         assert_eq!(all[1].uncompressed_bytes, 4);
+    }
+
+    /// The Extract page must offer only what the worker will actually do. `descent_for` says zip
+    /// and 7z (plus whatever the user allow-listed) and nothing else, so a `.pptx` that an older
+    /// scan descended into -- before the deny list existed -- is a normal file here, not an offer
+    /// `extract_archive` would refuse with "pptx is not an extractable archive format".
+    #[test]
+    fn only_descendable_formats_are_offered_for_extraction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cat = catalog_with_archives(
+            &tmp,
+            &[
+                ("bundle.zip", &[("a.txt", 4)]),
+                ("deck.pptx", &[("ppt/slide1.xml", 40)]),
+            ],
+        );
+
+        let listed: Vec<String> = archive_scopes(&cat, None, "vol-1", None, &test_limits())
+            .unwrap()
+            .into_iter()
+            .map(|a| a.relative_path)
+            .collect();
+
+        assert_eq!(listed, vec!["bundle.zip".to_string()]);
     }
 
     /// A refusal must not depend on how far the scan happened to get before it hit one.
